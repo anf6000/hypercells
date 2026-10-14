@@ -1,0 +1,1068 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, user-scalable=no">
+<link rel="icon" href="data:,">
+<title>hypercells — fluoddity-style physarum</title>
+<!--
+WebGL reimplementation of the Fluoddity algorithm (aphid91, github.com/aphid91/Fluoddity-Core).
+Vector-trail physarum: particles deposit 2D flow into a field, sense it with two mirrored
+sensors, and steer via an evolvable 10-term Fourier-feature rule. Four GPU passes per
+physics step: move (GPGPU entity ping-pong) -> deposit (instanced gaussian sprites) ->
+diffuse (canvas update) -> paint (permanent no-fade copy of the deposits). Display adds an
+optional accumulation buffer (long exposure) in front of the asinh tonemap. Two particle
+blend modes: additive (accumulate + tonemap) or solid paint (source-over, opaque colors,
+exposure/tonemap bypassed, bounded-memory fade on the paint). Each particle gets a small
+deterministic hue offset, and the whole palette drifts slowly over time. Field view
+hue-maps the paint/flow layer.
+-->
+<style>
+  :root { --accent:#7ee7ff; --panel:rgba(13,16,20,.78); --line:rgba(255,255,255,.09); }
+  html,body { margin:0; height:100%; overflow:hidden; background:#000; }
+  canvas#c { position:fixed; inset:0; width:100vw; height:100vh; display:block; }
+  #panel { position:fixed; top:14px; right:14px; width:308px; max-height:calc(100vh - 28px);
+    overflow-y:auto; background:var(--panel); backdrop-filter:blur(14px); -webkit-backdrop-filter:blur(14px);
+    border:1px solid var(--line); border-radius:12px; padding:12px 14px 10px; color:#cfd8dc;
+    font:12px/1.45 ui-monospace,Consolas,monospace; user-select:none; box-shadow:0 10px 40px rgba(0,0,0,.5); }
+  #panel.hidden { display:none; }
+  #panel::-webkit-scrollbar { width:8px; } #panel::-webkit-scrollbar-thumb { background:#2a3138; border-radius:4px; }
+  .title { font-size:13px; color:#fff; letter-spacing:.4px; display:flex; justify-content:space-between; align-items:center; }
+  .title a { color:var(--accent); text-decoration:none; font-size:10px; }
+  .sec { margin-top:10px; border-top:1px solid var(--line); padding-top:8px; }
+  .sec>h4 { margin:0 0 6px; font-size:10px; letter-spacing:1.2px; text-transform:uppercase; color:#8a939b; font-weight:600; }
+  .row { display:grid; grid-template-columns: 92px 1fr 52px; gap:8px; align-items:center; margin:3px 0; }
+  .row label { color:#aeb6bd; font-size:11px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+  .row output { text-align:right; color:#eff3f5; font-size:11px; font-variant-numeric:tabular-nums; }
+  input[type=range] { width:100%; height:14px; margin:0; accent-color:var(--accent); background:transparent; }
+  select { background:#161a1f; color:#dfe5e8; border:1px solid var(--line); border-radius:6px; padding:3px 6px; font:11px ui-monospace,monospace; width:100%; }
+  .btns { display:grid; grid-template-columns:repeat(3,1fr); gap:6px; margin-top:8px; }
+  button { background:#1b2026; color:#dfe5e8; border:1px solid var(--line); border-radius:7px; padding:6px 4px;
+    font:11px ui-monospace,monospace; cursor:pointer; }
+  button:hover { border-color:var(--accent); color:#fff; }
+  button.on { background:#123742; border-color:var(--accent); color:var(--accent); }
+  .hint { margin-top:10px; color:#5d666e; font-size:10px; line-height:1.6; border-top:1px solid var(--line); padding-top:6px; }
+  .hint b { color:#9aa3ab; font-weight:600; }
+  #hud { position:fixed; left:14px; bottom:12px; color:#7d868e; font:11px ui-monospace,monospace; user-select:none; }
+  #err { position:fixed; inset:0; margin:auto; width:min(720px,90vw); height:max-content; background:#1a1113; color:#ffb4b4;
+    padding:24px; border:1px solid #5a2a2a; border-radius:12px; font:12px ui-monospace,monospace; white-space:pre-wrap; display:none; z-index:10; }
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<div id="panel">
+  <div class="title"><span>hypercells</span><a href="https://github.com/aphid91/Fluoddity-Core" target="_blank" rel="noreferrer">algorithm: Fluoddity-Core &#8599;</a></div>
+  <div class="btns">
+    <button id="bPause">pause</button><button id="bReset">reset</button><button id="bNew">new</button>
+    <button id="bMutate">mutate</button><button id="bView">view: particles</button>
+    <button id="bHard">hard px</button><button id="bBlend">blend: solid</button>
+  </div>
+  <div class="sec"><h4>Organism</h4>
+    <div class="row"><label>presets</label><select id="selPreset" style="grid-column:2/4"></select></div>
+    <div class="row"><label>cohorts</label><input type="range" id="sCohorts" min="1" max="24" step="1"><output id="oCohorts"></output></div>
+    <div class="row"><label>world size</label><select id="selQuality" style="grid-column:2/4">
+      <option value="0.08">tiny</option><option value="0.25">small</option><option value="0.5">medium</option><option value="1">large</option></select></div>
+    <div class="row"><label>start</label><select id="selInit" style="grid-column:2/4">
+      <option value="1">random</option><option value="0">grid</option><option value="2">ring</option></select></div>
+  </div>
+  <div class="sec"><h4>Physics</h4><div id="secPhysics"></div></div>
+  <div class="sec"><h4>Field &amp; render</h4><div id="secField"></div></div>
+  <div class="btns">
+    <button id="bShare" style="grid-column:1/4">copy state link</button>
+    <button id="bSave">save json</button><button id="bLoad" style="grid-column:2/4">load json</button>
+  </div>
+  <input type="file" id="fileLoad" accept="application/json,.json" style="display:none">
+  <div class="hint"><b>space</b> pause &nbsp;· <b>r</b> reset &nbsp;· <b>n</b> new organism &nbsp;· <b>m</b> mutate &nbsp;· <b>f</b> field view &nbsp;· <b>p</b> hard pixels &nbsp;· <b>b</b> blend mode &nbsp;· <b>h</b> hide panel.</div>
+</div>
+<div id="hud"></div>
+<div id="err"></div>
+<script id="presets" type="application/json">
+{"HungryHungryHippos":{"physics":{"axial_force":0.35925570130348206,"lateral_force":-1.293696641921997,"sensor_gain":0.9078231453895569,"mutation_scale":0.14,"drag":0.5608117580413818,"strafe_power":0.07624772191047668,"sensor_angle":-0.728590726852417,"global_force_mult":-0.3406755328178406,"sensor_distance":-1.0521172285079956,"trail_persistence":0.982,"trail_diffusion":1,"hazard_rate":0},"settings":{"initial_conditions":1,"num_cohorts":8,"rule_seed":0.4862983671108597},"rule":[1.2064379453659058,1.067139744758606,1.2132219076156616,-0.12498120963573456,1.5426808595657349,-0.2381400465965271,-1.6898831129074097,1.2356244325637817,-0.7950752973556519,0.8675197958946228,0.7583622336387634,0.8555039763450623,-0.4020692706108093,0.31403112411499023,-1.0033940076828003,-0.7093168497085571,3.5040769577026367,3.050676107406616,1.4465839862823486,2.246659517288208,-2.1314163208007812,-0.002818688750267029,-0.37139642238616943,1.2416610717773438,1.1865310668945312,1.286213755607605,-0.9745411276817322,-0.6409617066383362,-0.021761491894721985,0.7107173800468445,-0.20683011412620544,0.2877289354801178,1.4541025161743164,1.0496876239776611,1.4966915845870972,-0.9024308323860168,-0.10237443447113037,-1.4029918909072876,-0.17698410153388977,-1.4599552154541016,-0.5519824624061584,0.684830904006958,0.5333976745605469,-0.8555260896682739,0.9248912334442139,-1.845164179801941,0.904996395111084,0.9833927154541016,-0.8521580100059509,-0.9560102224349976,-0.252249538898468,-0.28091707825660706,0.7234344482421875,0.8838722109794617,1.5286259651184082,-0.26113516092300415,0.3846791386604309,-1.164605975151062,0.06522984057664871,0.14904245734214783,-0.1396895945072174,-0.6890721321105957,0.642676591873169,0.3004353642463684,-0.11368437111377716,-0.0009936660062521696,-0.759465754032135,-1.0703999996185303,1.16761314868927,-0.7396655082702637,0.8717650175094604,-1.5144052505493164,2.6468586921691895,1.8602746725082397,-1.087221384048462,2.2106218338012695,-0.9733583927154541,-1.1184961795806885,0.107132688164711,-0.1786668747663498]},
+"Corners":{"physics":{"axial_force":0.022,"lateral_force":-0.186,"sensor_gain":1.369,"mutation_scale":0.095,"drag":0.125,"strafe_power":0.169,"sensor_angle":-0.141,"global_force_mult":0.94,"sensor_distance":1.013,"trail_persistence":0.943,"trail_diffusion":1,"hazard_rate":0},"settings":{"initial_conditions":1,"num_cohorts":6,"rule_seed":0.6633918167161669},"rule":[0.2723119258880615,0.2353467047214508,-0.36034446954727173,-0.0951252430677414,0.6235610246658325,3.0134029388427734,0.02889615297317505,0.6329693794250488,1.5284978151321411,-1.9310680627822876,-0.8994591236114502,-2.6522579193115234,-0.7968136072158813,-0.45192423462867737,-1.2523813247680664,0.9024071097373962,0.6202709078788757,-3.0892333984375,2.7001781463623047,1.0300898551940918,0.26124876737594604,0.7132430076599121,-0.521882176399231,2.613840341567993,1.4098798036575317,2.794755458831787,-2.9237189292907715,-1.8103021383285522,-0.2040163278579712,-0.0113610178232193,1.589127540588379,0.3890281319618225,-0.3837513327598572,-1.5257279872894287,-1.3210279941558838,-1.264946699142456,1.761325478553772,1.8376810550689697,-0.404127836227417,0.15399736166000366,0.08247791230678558,0.6491791605949402,0.36356863379478455,-0.34408271312713623,-1.0078920125961304,1.1372640132904053,-0.3193916082382202,-2.4857420921325684,0.3343924880027771,0.7741389274597168,-1.851560354232788,0.24103252589702606,0.45115506649017334,0.6353343725204468,-0.4594263434410095,-1.390197515487671,0.6367928385734558,0.1399131566286087,1.6079392433166504,1.3056485652923584,-0.5525392293930054,-2.5010201930999756,1.3425178527832031,1.339195728302002,-0.3298691511154175,-0.18361499905586243,0.07833869010210037,0.3052905797958374,0.48558253049850464,-0.991615355014801,-2.480074882507324,1.5251983404159546,-0.21395477652549744,0.07011644542217255,0.3962416350841522,0.3858237862586975,-1.6735206842422485,2.7825396060943604,0.17345786094665527,2.216310977935791]},
+"9LeafClovers":{"physics":{"axial_force":0.022,"lateral_force":-0.186,"sensor_gain":4.346,"mutation_scale":0.236,"drag":0.125,"strafe_power":0.169,"sensor_angle":-0.141,"global_force_mult":0.94,"sensor_distance":1.013,"trail_persistence":0.943,"trail_diffusion":1,"hazard_rate":0},"settings":{"initial_conditions":1,"num_cohorts":1,"rule_seed":0.7792261563787203},"rule":[0.30871841311454773,0.2668111026287079,-0.40852031111717224,-0.10784289985895157,0.1341909021139145,1.0955612659454346,0.9584488868713379,0.03012336790561676,1.5596504211425781,-1.9704253673553467,-0.9177911877632141,-2.7063138484954834,-0.752485454082489,0.30377432703971863,-1.3242547512054443,-0.8374620676040649,0.48819229006767273,-2.4314217567443848,2.125211238861084,0.8107457756996155,-0.5121806859970093,1.0502769947052002,1.1394836902618408,2.000248670578003,1.0410889387130737,2.0637149810791016,-2.1589443683624268,-1.3367706537246704,-0.8152588605880737,-1.1830593347549438,-0.19745463132858276,1.4832735061645508,-0.4410875737667084,-1.7536864280700684,-1.5184026956558228,-1.4539422988891602,1.1246709823608398,0.8677715063095093,0.40814265608787537,0.49253296852111816,0.11196213215589523,0.8812480568885803,0.4935372769832611,-0.46708568930625916,-0.620029091835022,2.311511993408203,-0.9370143413543701,-1.4188916683197021,0.19754177331924438,0.4573211371898651,-1.0938060283660889,0.14238955080509186,-1.4590283632278442,0.2929561138153076,-0.4515392780303955,0.1683899164199829,0.5785334706306458,0.12711259722709656,1.4608304500579834,1.1861963272094727,-0.40854278206825256,-0.4413979152053833,0.8244497776031494,1.145101547241211,-0.42757052183151245,-0.23799845576286316,0.10154121369123459,0.3957122266292572,1.3221192359924316,-0.9881879091262817,-2.7022597789764404,1.2729225158691406,-0.28964725136756897,0.09492208063602448,0.5364229083061218,0.522319495677948,-0.07884250581264496,1.4948761463165283,-0.2380172610282898,1.1930195093154907]}}
+</script>
+<script type="module">
+const $ = id => document.getElementById(id);
+const errbox = $('err');
+let errored = false;
+function fatal(msg){ if (errored) return; errored = true; errbox.style.display = 'block'; errbox.textContent = msg; if (parent !== window) throw new Error(msg); }
+window.addEventListener('error', e => fatal('Error: ' + e.message + (e.filename ? '\n' + e.filename + ':' + e.lineno : '')));
+
+function fitCanvasBacking(){
+  const c = $('c');
+  const w = Math.max(2, Math.round(window.innerWidth));
+  const h = Math.max(2, Math.round(window.innerHeight));
+  if (c.width !== w || c.height !== h){ c.width = w; c.height = h; }
+}
+fitCanvasBacking();
+window.addEventListener('resize', fitCanvasBacking);
+
+const gl = $('c').getContext('webgl2', {alpha:false, antialias:false, depth:false, stencil:false, powerPreference:'high-performance'});
+if (!gl) fatal('WebGL2 is not available in this browser.');
+if (!gl.getExtension('EXT_color_buffer_float')) fatal('EXT_color_buffer_float is not available; cannot run the GPU simulation.');
+gl.getExtension('EXT_float_blend');
+const floatLinear = !!gl.getExtension('OES_texture_float_linear');
+
+function compile(type, src){
+  const s = gl.createShader(type); gl.shaderSource(s, src); gl.compileShader(s);
+  if (!gl.getShaderParameter(s, gl.COMPILE_STATUS)) fatal('Shader compile failed:\n' + gl.getShaderInfoLog(s));
+  return s;
+}
+const locCache = new WeakMap();
+function loc(p, n){ let c = locCache.get(p); if (!c) locCache.set(p, c = {}); if (!(n in c)) c[n] = gl.getUniformLocation(p, n); return c[n]; }
+function makeProgram(vs, fs){
+  const p = gl.createProgram();
+  gl.attachShader(p, compile(gl.VERTEX_SHADER, vs));
+  gl.attachShader(p, compile(gl.FRAGMENT_SHADER, fs));
+  gl.linkProgram(p);
+  if (!gl.getProgramParameter(p, gl.LINK_STATUS)) fatal('Program link failed:\n' + gl.getProgramInfoLog(p));
+  return p;
+}
+function u1i(p, n, v){ const l = loc(p, n); if (l) gl.uniform1i(l, v|0); }
+function u1f(p, n, v){ const l = loc(p, n); if (l) gl.uniform1f(l, v); }
+function u2f(p, n, v){ const l = loc(p, n); if (l) gl.uniform2f(l, v[0], v[1]); }
+function u4f(p, n, v){ const l = loc(p, n); if (l) gl.uniform4f(l, v[0], v[1], v[2], v[3]); }
+function bindTex(unit, tex, p, name){ gl.activeTexture(gl.TEXTURE0 + unit); gl.bindTexture(gl.TEXTURE_2D, tex); u1i(p, name, unit); }
+
+const QUAD_VS = `#version 300 es
+layout(location=0) in vec2 in_position;
+out vec2 uv;
+void main(){ uv = in_position * 0.5 + 0.5; gl_Position = vec4(in_position, 0.0, 1.0); }`;
+
+const ENTITY_FS = `#version 300 es
+precision highp float;
+precision highp int;
+
+struct FourierCenter { vec4 frequency; vec4 amplitude; };
+struct Rule { FourierCenter centers[10]; };
+uniform Rule config_rule;
+
+uniform vec4 config_a;  // cohorts, rule_seed, sensor_gain, sensor_angle
+uniform vec4 config_b;  // sensor_distance, mutation_scale, global_force_mult, drag
+uniform vec4 config_c;  // strafe_power, axial_force, lateral_force, hazard_rate
+
+uniform int initial_conditions;
+uniform float u_reset_seed;
+uniform float sqrt_world_size;
+uniform vec2 tex_scale;
+
+uniform sampler2D entity_texture;
+uniform sampler2D canvas_texture;
+uniform int frame_count;
+uniform int entity_count;
+uniform int entity_tex_width;
+
+in vec2 uv;
+out vec4 fragColor;
+
+#define PI 3.1415926
+
+uint pcg_hash(uint seed){
+  uint state = seed * 747796405u + 2891336453u;
+  uint word = ((state >> ((state >> 28u) + 4u)) ^ state) * 277803737u;
+  return (word >> 22u) ^ word;
+}
+float hash(vec2 co){
+  uvec2 u = uvec2(floatBitsToUint(co.x), floatBitsToUint(co.y));
+  uint h = pcg_hash(u.x ^ pcg_hash(u.y));
+  return float(h) / float(0xffffffffu);
+}
+vec4 hash4(vec2 co){
+  return vec4(hash(co), hash(co * -1.0 + 5.0), hash(co.yx - 100.0), hash(co.yx * -1.0 + 25.0));
+}
+vec4 fourier_noise(FourierCenter centers[10], vec4 signals){
+  vec4 result = vec4(0.0);
+  for (int i = 0; i < 10; i++){
+    float phase = dot(signals, centers[i].frequency);
+    float phase_offset = 2.0 * float(i) * 0.6283 + centers[i].amplitude.w * 3.14159;
+    vec4 basis = vec4(
+      sin(phase + phase_offset),
+      cos(phase + phase_offset * 0.7),
+      sin(phase * 2.0 + phase_offset * 1.3),
+      cos(phase * 2.0 + phase_offset * 0.5));
+    result += centers[i].amplitude * basis;
+  }
+  return result;
+}
+FourierCenter[10] generate_random_centers(float seed){
+  FourierCenter centers[10];
+  for (int i = 0; i < 10; i++){
+    float freq_scale = 1.0 + 2.0 * pow(hash(vec2(seed, float(i * 8 + 0))), 2.0);
+    centers[i].frequency.x = (hash(vec2(seed, float(i * 8 + 0))) * 2.0 - 1.0) * freq_scale;
+    centers[i].frequency.y = (hash(vec2(seed, float(i * 8 + 1))) * 2.0 - 1.0) * freq_scale;
+    centers[i].frequency.z = (hash(vec2(seed, float(i * 8 + 2))) * 2.0 - 1.0) * freq_scale;
+    centers[i].frequency.w = (hash(vec2(seed, float(i * 8 + 3))) * 2.0 - 1.0) * freq_scale;
+    centers[i].amplitude.x = hash(vec2(seed, float(i * 8 + 4))) * 2.0 - 1.0;
+    centers[i].amplitude.y = hash(vec2(seed, float(i * 8 + 5))) * 2.0 - 1.0;
+    centers[i].amplitude.z = hash(vec2(seed, float(i * 8 + 6))) * 2.0 - 1.0;
+    centers[i].amplitude.w = hash(vec2(seed, float(i * 8 + 7))) * 2.0 - 1.0;
+  }
+  return centers;
+}
+void mutate_rule(inout Rule current_rule, float amount, float cohort){
+  float seed = hash(current_rule.centers[4].frequency.xy + current_rule.centers[7].amplitude.yx + current_rule.centers[1].frequency.zw) + cohort;
+  for (int i = 0; i < 10; i++){
+    vec4 amp_mutation = amount * (-1.0 + 2.0 * hash4(-0.5 + vec2(-float(i) + seed, float(i))));
+    current_rule.centers[i].amplitude += amp_mutation;
+    current_rule.centers[i].frequency *= 1.0 + amount * 0.5 * (hash(vec2(seed, float(i))) - 0.5);
+  }
+}
+void pR(inout vec2 p, float a){ p = cos(a) * p + sin(a) * vec2(p.y, -p.x); }
+vec4 get_can(vec2 p){ return texture(canvas_texture, p * tex_scale * 0.5 + 0.5); }
+vec2 safenorm(vec2 p){ return length(p) == 0.0 ? vec2(0.0) : normalize(p); }
+float get_cohort(int index){ return float(config_a.x) * float(index) / float(entity_count); }
+
+vec4 do_reset(int index){
+  float cohort_val = get_cohort(index);
+  float cohorts = config_a.x;
+  vec2 pos = 0.019 * (vec2(hash(vec2(cohort_val, u_reset_seed)), hash(vec2(cohort_val + float(index) + 2.142, u_reset_seed + 0.5))) - 0.5);
+  vec2 vel = 0.01 * 0.005 * (vec2(hash(vec2(cohort_val, float(index))), hash(vec2(cohort_val, pos.y))) * 2.0 - 1.0);
+  if (initial_conditions == 0){
+    float spot_rows = ceil(sqrt(cohorts));
+    float gcx = mod(float(int(cohort_val)), spot_rows);
+    float gcy = floor(float(int(cohort_val)) / spot_rows);
+    pos += vec2(1.0 / tex_scale.x, 1.0 / tex_scale.y) * 1.8 * (vec2(gcx, gcy) / spot_rows + 0.5 * (1.0 / spot_rows - 1.0));
+  } else if (initial_conditions == 1){
+    pos = vec2(hash(vec2(cohort_val, u_reset_seed + 1.0)), hash(vec2(cohort_val, u_reset_seed + 2.0))) * 2.0 - 1.0;
+  } else {
+    float angle = cohort_val / cohorts * 2.0 * PI;
+    float radius = 0.5 * min(1.0 / tex_scale.x, 1.0 / tex_scale.y);
+    pos += vec2(cos(angle), sin(angle)) * radius;
+  }
+  return vec4(pos, vel);
+}
+vec4 black_box(vec2 L, vec2 R, Rule rule){ return fourier_noise(rule.centers, vec4(L, R)); }
+vec2 y_reflect(vec2 p){ return p * vec2(1.0, -1.0); }
+
+void calculate_entity_behavior(vec2 L, vec2 R, vec2 axis, Rule rule, out vec2 force, out vec2 strafe){
+  vec2 forward = safenorm(axis);
+  vec2 left = vec2(forward.y, -forward.x);
+  L = vec2(dot(L, forward), dot(L, left));
+  R = vec2(dot(R, forward), dot(R, left));
+  vec4 baseterm = black_box(L, R, rule);
+  vec4 mirrorterm = black_box(y_reflect(R), y_reflect(L), rule);
+  force = baseterm.xy + y_reflect(mirrorterm.xy);
+  strafe = baseterm.zw + y_reflect(mirrorterm.zw);
+  // axial/lateral scale the LOCAL frame components (scaling world x/y here caused the vertical bias)
+  force  = forward * (force.x  * config_c.y) + left * (force.y  * config_c.z);
+  strafe = forward * (strafe.x * config_c.y) + left * (strafe.y * config_c.z);
+}
+
+void main(){
+  ivec2 pixel = ivec2(gl_FragCoord.xy);
+  int index = pixel.y * entity_tex_width + pixel.x;
+  if (index >= entity_count){ fragColor = vec4(0.0); return; }
+
+  vec4 e = texelFetch(entity_texture, pixel, 0);
+  vec2 pos = e.xy, vel = e.zw;
+  float cohort = get_cohort(index);
+  Rule rule = config_rule;
+
+  bool hazard_reset = config_c.w > hash(vec2(float(index) / float(entity_count), float(frame_count)));
+  if (frame_count == 0 || hazard_reset){ fragColor = do_reset(index); return; }
+
+  float sample_dist = 1.0 / sqrt_world_size * 0.005 * config_b.x;
+  vec2 orientation = safenorm(vel);
+  vec2 lso = orientation; pR(lso,  config_a.w * PI);
+  vec2 rso = orientation; pR(rso, -config_a.w * PI);
+  vec4 ltap = get_can(pos + lso * sample_dist);
+  vec4 rtap = get_can(pos + rso * sample_dist);
+
+  if (rule.centers[0].frequency == vec4(0) && rule.centers[5].amplitude == vec4(0))
+    rule = Rule(generate_random_centers(config_a.y + floor(cohort)));
+  mutate_rule(rule, config_b.y, config_a.y + floor(cohort));
+
+  float sensor_scaling = sqrt_world_size * 38.855 * config_a.z;
+  ltap *= sensor_scaling;
+  rtap *= sensor_scaling;
+
+  vec2 strafe = vec2(0.0), force = vec2(0.0);
+  calculate_entity_behavior(ltap.xy, rtap.xy, orientation, rule, force, strafe);
+  force *= 1.0 / sqrt_world_size * config_b.z / 400.0;
+  strafe *= 1.0 / sqrt_world_size * config_b.z / 20.0;
+
+  vel = vel * config_b.w + force;
+  pos += vel;
+  pos += strafe * config_c.x;
+  pos = 2.0 * (fract(pos / 2.0 - 0.5) - 0.5);
+  fragColor = vec4(pos, vel);
+}`;
+
+const BRUSH_VS = `#version 300 es
+layout(location=0) in vec2 a_offset;
+layout(location=1) in vec2 a_uv;
+uniform sampler2D entity_texture;
+uniform int entity_tex_width;
+uniform float sqrt_world_size;
+uniform vec2 tex_scale;
+out vec2 v_uv;
+out vec4 v_pos_vel;
+void main(){
+  ivec2 tc = ivec2(gl_InstanceID % entity_tex_width, gl_InstanceID / entity_tex_width);
+  vec4 entity = texelFetch(entity_texture, tc, 0);
+  float size = 0.0015 / sqrt_world_size;
+  vec2 vp = entity.xy + a_offset * size;
+  gl_Position = vec4(vp, 0.0, 1.0) * vec4(tex_scale, 1.0, 1.0);
+  v_uv = a_uv;
+  v_pos_vel = entity;
+}`;
+
+const BRUSH_FS = `#version 300 es
+precision highp float;
+in vec2 v_uv;
+in vec4 v_pos_vel;
+layout(location = 0) out vec4 brush_out;
+uniform int frame_count;
+float gaussian(vec2 pos, float sigma){
+  float sigma2 = sigma * sigma;
+  float norm = 1.0 / (2.0 * 3.14159265359 * sigma2);
+  float exponent = -(dot(pos, pos)) / (2.0 * sigma2);
+  return norm * exp(exponent);
+}
+void main(){
+  float kernel_func = gaussian(v_uv - 0.5, 0.163);
+  if (length(v_uv - 0.5) > 0.5 || frame_count == 0) discard;
+  vec2 vel = v_pos_vel.zw;
+  brush_out = vec4(vel, 0.01, 1.0) * kernel_func;
+}`;
+
+const CANVAS_FS = `#version 300 es
+precision highp float;
+uniform vec2 persistence_diffusion; // trail_persistence, trail_diffusion
+uniform float paint_gain;           // additive deposit rate (paint mode)
+uniform sampler2D brush_texture;
+uniform sampler2D canvas_texture;
+uniform int frame_count;
+in vec2 uv;
+out vec4 canvas_out;
+vec4 getCan(vec2 p, sampler2D sam){ return texture(sam, fract(p)); }
+vec4 getBlur(vec2 pos, sampler2D sam, float K){
+  vec3 off = vec3(1.0 / vec2(textureSize(sam, 0)), 0.0);
+  vec4 nc = getCan(pos + off.zy, sam); vec4 sc = getCan(pos - off.zy, sam);
+  vec4 wc = getCan(pos - off.xz, sam); vec4 ec = getCan(pos + off.xz, sam);
+  return (getCan(pos, sam) * K + nc + sc + wc + ec) / (4.0 + K);
+}
+void main(){
+  if (frame_count < 2){ canvas_out = vec4(0.0, 0.0, 0.0, 1.0); return; }
+  float p = persistence_diffusion.x, d = persistence_diffusion.y;
+  vec4 brush_color = texture(brush_texture, uv);
+  vec4 canvas_color;
+  if (d > 0.0){
+    float K = d * d;
+    K = 4.0 / (pow(5.0, K) - 1.0);
+    canvas_color = getBlur(uv, canvas_texture, K);
+  } else canvas_color = texture(canvas_texture, uv);
+  canvas_out = canvas_color * p + vec4(brush_color.xy, 0.0, 1.0) * paint_gain;  // paint_gain = 1-p for the physics field
+  canvas_out.w = 1.0;
+}`;
+
+const FIELD_FS = `#version 300 es
+precision highp float;
+uniform sampler2D tex;
+uniform float brightness;
+uniform float u_hard;
+in vec2 uv; out vec4 fragColor;
+vec3 hsv2rgb(vec3 c){
+  vec4 K = vec4(1.0, 2.0 / 3.0, 1.0 / 3.0, 3.0);
+  vec3 p = abs(fract(c.xxx + K.xyz) * 6.0 - K.www);
+  return c.z * mix(K.xxx, clamp(p - K.xxx, 0.0, 1.0), c.y);
+}
+void main(){
+  vec2 res = vec2(textureSize(tex, 0));
+  vec2 suv = u_hard > 0.5 ? (floor(uv * res) + 0.5) / res : uv;
+  vec4 canv = texture(tex, suv);
+  float speed = length(canv.xy);
+  if (speed < 1e-6){ fragColor = vec4(0.0, 0.0, 0.0, 1.0); return; }
+  float tone = speed / (speed + 1.0);
+  vec3 rgb = hsv2rgb(vec3(atan(canv.y, canv.x) / 6.2831853, 0.75, tone)) * 1.5;
+  fragColor = vec4(rgb, 1.0);
+  fragColor.xyz *= brightness;
+}`;
+
+const SPRITE_VS = `#version 300 es
+#define SPRITE_SIZE 1.5
+uniform sampler2D entity_texture;
+uniform int entity_tex_width;
+uniform int entity_count;
+uniform int cohorts;
+uniform float sqrt_world_size;
+uniform vec2 tex_scale;
+uniform float u_solid;
+uniform float u_time;
+out vec2 v_uv;
+out vec4 v_color;
+uint pcg_hash(uint seed){
+  uint state = seed * 747796405u + 2891336453u;
+  uint word = ((state >> ((state >> 28u) + 4u)) ^ state) * 277803737u;
+  return (word >> 22u) ^ word;
+}
+float hash_float(uint x){ return float(pcg_hash(x)) / float(0xffffffffu); }
+void main(){
+  ivec2 tc = ivec2(gl_InstanceID % entity_tex_width, gl_InstanceID / entity_tex_width);
+  vec4 entity = texelFetch(entity_texture, tc, 0);
+  vec2 entity_pos = entity.xy;
+  float size = SPRITE_SIZE * 0.0015 / sqrt_world_size;
+  int cohort_index = int(floor(float(gl_InstanceID) * float(cohorts) / float(entity_count)));
+  float hue = hash_float(uint(cohort_index) * 2654435761u);
+  hue += (hash_float(uint(gl_InstanceID) * 2246822519u) - 0.5) * 0.06;  // +-3% per-particle colour noise
+  hue = fract(hue + u_time * 0.01);                                     // slow hue drift for the whole swarm
+  v_color = vec4(hue, 0.8, 1.0, mix(0.045, 1.0, u_solid));
+  vec2 offsets[4] = vec2[4](vec2(-size, -size), vec2(size, -size), vec2(size, size), vec2(-size, size));
+  vec2 uv_coords[4] = vec2[4](vec2(0.0, 0.0), vec2(1.0, 0.0), vec2(1.0, 1.0), vec2(0.0, 1.0));
+  bool visible = abs(entity_pos.x) <= 1.0 / tex_scale.x && abs(entity_pos.y) <= 1.0 / tex_scale.y;
+  vec2 vp = entity_pos + (visible ? offsets[gl_VertexID] : vec2(0.0));
+  gl_Position = vec4(vp * tex_scale, 0.0, 1.0);
+  v_uv = uv_coords[gl_VertexID];
+}`;
+
+const SPRITE_FS = `#version 300 es
+precision highp float;
+in vec2 v_uv;
+in vec4 v_color;
+out vec4 fragColor;
+uniform float brightness;
+uniform float u_hard;
+uniform float u_solid;
+vec3 hsv2rgb(vec3 c){
+  vec4 K = vec4(1.0, 2.0 / 3.0, 1.0 / 3.0, 3.0);
+  vec3 p = abs(fract(c.xxx + K.xyz) * 6.0 - K.www);
+  return c.z * mix(K.xxx, clamp(p - K.xxx, 0.0, 1.0), c.y);
+}
+float gaussian(vec2 pos, float sigma){
+  float sigma2 = sigma * sigma;
+  float norm = 1.0 / (2.0 * 3.14159265359 * sigma2);
+  float exponent = -(dot(pos, pos)) / (2.0 * sigma2);
+  return norm * exp(exponent);
+}
+void main(){
+  vec2 centered_uv = v_uv - 0.5;
+  float kernel = u_hard > 0.5 ? 1.0 : 0.5 * gaussian(centered_uv, 0.163);
+  if (u_hard < 0.5 && length(centered_uv) > 0.5) discard;
+  vec3 rgb = hsv2rgb(v_color.xyz) * brightness * mix(3.0, 1.0, u_solid);
+  fragColor = vec4(rgb, min(v_color.w * kernel, 1.0));
+}`;
+
+const COMP_FS = `#version 300 es
+precision highp float;
+uniform sampler2D view_tex;
+uniform sampler2D accum_tex;
+uniform float accum_amount;
+uniform float u_solid;
+uniform float u_fade;
+in vec2 uv; out vec4 o;
+void main(){
+  vec4 v = texture(view_tex, uv);
+  vec4 a = texture(accum_tex, uv);
+  if (u_solid > 0.5){
+    float sa = clamp(v.a * accum_amount, 0.0, 1.0);
+    o = vec4(v.rgb * accum_amount + a.rgb * (1.0 - sa) * u_fade, max(sa, a.a * u_fade));
+  } else o = v + a * accum_amount;
+}`;
+
+const PRESENT_FS = `#version 300 es
+precision highp float;
+uniform sampler2D tex;
+uniform ivec2 offset;   // integer window->sim offset (avoids half-pixel column/row duplication)
+uniform int scale;      // integer upscale (no uneven nearest-neighbour columns)
+out vec4 o;
+void main(){
+  ivec2 sp = ivec2(gl_FragCoord.xy) - offset;
+  ivec2 sz = textureSize(tex, 0) * scale;
+  if (any(lessThan(sp, ivec2(0))) || any(greaterThanEqual(sp, sz))){ o = vec4(0.0, 0.0, 0.0, 1.0); return; }
+  o = vec4(texelFetch(tex, sp / scale, 0).rgb, 1.0);
+}`;
+
+const TONEMAP_FS = `#version 300 es
+precision highp float;
+#define TONEMAP_SOFTNESS 3.9
+#define BRIGHTNESS_CONSTANT 2.
+uniform sampler2D source_tex;
+uniform float u_tone;
+in vec2 uv; out vec4 fragColor;
+void main(){
+  fragColor = texture(source_tex, uv);
+  float len = length(fragColor.xyz);
+  if (len > 0.0) fragColor.xyz *= mix(1.0, BRIGHTNESS_CONSTANT * asinh(len * TONEMAP_SOFTNESS) / (len * TONEMAP_SOFTNESS), u_tone);
+}`;
+
+const PRESETS = JSON.parse($('presets').textContent);
+// Default look (applied when the URL carries no #c= state).
+const DEFAULT_STATE = 'eyJjIjp7ImNvaG9ydHMiOjEyLCJydWxlX3NlZWQiOjAuNDg2Mjk4MzY3MTEwODU5Nywic2Vuc29yX2dhaW4iOjAuOTA3ODIzMTQ1Mzg5NTU2OSwic2Vuc29yX2FuZ2xlIjotMC43Mjg1OTA3MjY4NTI0MTcsInNlbnNvcl9kaXN0YW5jZSI6LTEuMDUyMTE3MjI4NTA3OTk1NiwibXV0YXRpb25fc2NhbGUiOjAuMTQsImdsb2JhbF9mb3JjZV9tdWx0IjotMC4zNDA2NzU1MzI4MTc4NDA2LCJkcmFnIjowLjU2MDgxMTc1ODA0MTM4MTgsInN0cmFmZV9wb3dlciI6MC4wNzYyNDc3MjE5MTA0NzY2OCwiYXhpYWxfZm9yY2UiOjAuMzU5MjU1NzAxMzAzNDgyMDYsImxhdGVyYWxfZm9yY2UiOi0xLjI5MzY5NjY0MTkyMTk5NywiaGF6YXJkX3JhdGUiOjAsInRyYWlsX3BlcnNpc3RlbmNlIjowLjk4MiwidHJhaWxfZGlmZnVzaW9uIjoxLCJwYWludF9nYWluIjowLjAxNiwicGFpbnRfcGVyc2lzdGVuY2UiOjAuOTk1LCJpbml0aWFsX2NvbmRpdGlvbnMiOjIsInJ1bGUiOlsxLjIwNjQzNzk0NTM2NTkwNTgsMS4wNjcxMzk3NDQ3NTg2MDYsMS4yMTMyMjE5MDc2MTU2NjE2LC0wLjEyNDk4MTIwOTYzNTczNDU2LDEuNTQyNjgwODU5NTY1NzM0OSwtMC4yMzgxNDAwNDY1OTY1MjcxLC0xLjY4OTg4MzExMjkwNzQwOTcsMS4yMzU2MjQ0MzI1NjM3ODE3LC0wLjc5NTA3NTI5NzM1NTY1MTksMC44Njc1MTk3OTU4OTQ2MjI4LDAuNzU4MzYyMjMzNjM4NzYzNCwwLjg1NTUwMzk3NjM0NTA2MjMsLTAuNDAyMDY5MjcwNjEwODA5MywwLjMxNDAzMTEyNDExNDk5MDIzLC0xLjAwMzM5NDAwNzY4MjgwMDMsLTAuNzA5MzE2ODQ5NzA4NTU3MSwzLjUwNDA3Njk1NzcwMjYzNjcsMy4wNTA2NzYxMDc0MDY2MTYsMS40NDY1ODM5ODYyODIzNDg2LDIuMjQ2NjU5NTE3Mjg4MjA4LC0yLjEzMTQxNjMyMDgwMDc4MTIsLTAuMDAyODE4Njg4NzUwMjY3MDI5LC0wLjM3MTM5NjQyMjM4NjE2OTQzLDEuMjQxNjYxMDcxNzc3MzQzOCwxLjE4NjUzMTA2Njg5NDUzMTIsMS4yODYyMTM3NTU2MDc2MDUsLTAuOTc0NTQxMTI3NjgxNzMyMiwtMC42NDA5NjE3MDY2MzgzMzYyLC0wLjAyMTc2MTQ5MTg5NDcyMTk4NSwwLjcxMDcxNzM4MDA0Njg0NDUsLTAuMjA2ODMwMTE0MTI2MjA1NDQsMC4yODc3Mjg5MzU0ODAxMTc4LDEuNDU0MTAyNTE2MTc0MzE2NCwxLjA0OTY4NzYyMzk3NzY2MTEsMS40OTY2OTE1ODQ1ODcwOTcyLC0wLjkwMjQzMDgzMjM4NjAxNjgsLTAuMTAyMzc0NDM0NDcxMTMwMzcsLTEuNDAyOTkxODkwOTA3Mjg3NiwtMC4xNzY5ODQxMDE1MzM4ODk3NywtMS40NTk5NTUyMTU0NTQxMDE2LC0wLjU1MTk4MjQ2MjQwNjE1ODQsMC42ODQ4MzA5MDQwMDY5NTgsMC41MzMzOTc2NzQ1NjA1NDY5LC0wLjg1NTUyNjA4OTY2ODI3MzksMC45MjQ4OTEyMzM0NDQyMTM5LC0xLjg0NTE2NDE3OTgwMTk0MSwwLjkwNDk5NjM5NTExMTA4NCwwLjk4MzM5MjcxNTQ1NDEwMTYsLTAuODUyMTU4MDEwMDA1OTUwOSwtMC45NTYwMTAyMjI0MzQ5OTc2LC0wLjI1MjI0OTUzODg5ODQ2OCwtMC4yODA5MTcwNzgyNTY2MDcwNiwwLjcyMzQzNDQ0ODI0MjE4NzUsMC44ODM4NzIyMTA5Nzk0NjE3LDEuNTI4NjI1OTY1MTE4NDA4MiwtMC4yNjExMzUxNjA5MjMwMDQxNSwwLjM4NDY3OTEzODY2MDQzMDksLTEuMTY0NjA1OTc1MTUxMDYyLDAuMDY1MjI5ODQwNTc2NjQ4NzEsMC4xNDkwNDI0NTczNDIxNDc4MywtMC4xMzk2ODk1OTQ1MDcyMTc0LC0wLjY4OTA3MjEzMjExMDU5NTcsMC42NDI2NzY1OTE4NzMxNjksMC4zMDA0MzUzNjQyNDYzNjg0LC0wLjExMzY4NDM3MTExMzc3NzE2LC0wLjAwMDk5MzY2NjAwNjI1MjE2OTYsLTAuNzU5NDY1NzU0MDMyMTM1LC0xLjA3MDM5OTk5OTYxODUzMDMsMS4xNjc2MTMxNDg2ODkyNywtMC43Mzk2NjU1MDgyNzAyNjM3LDAuODcxNzY1MDE3NTA5NDYwNCwtMS41MTQ0MDUyNTA1NDkzMTY0LDIuNjQ2ODU4NjkyMTY5MTg5NSwxLjg2MDI3NDY3MjUwODIzOTcsLTEuMDg3MjIxMzg0MDQ4NDYyLDIuMjEwNjIxODMzODAxMjY5NSwtMC45NzMzNTgzOTI3MTU0NTQxLC0xLjExODQ5NjE3OTU4MDY4ODUsMC4xMDcxMzI2ODgxNjQ3MTEsLTAuMTc4NjY2ODc0NzY2MzQ5OF0sIl9fcG93ZXIiOjEsIl9fYWNjdW0iOjAuOTMsIl9fc29saWRGYWRlIjoxLCJfX2JyaWdodG5lc3MiOjAuNzR9LCJhIjp7InZpZXciOiJwYXJ0aWNsZXMiLCJibGVuZCI6InNvbGlkIiwiYnJpZ2h0bmVzcyI6MC43NCwiZ2xvdyI6MC4xOCwic2ltV29ybGRTaXplIjoxLCJzdGVwc1BlckZyYW1lIjoxLCJoYXJkIjpmYWxzZSwiYWNjdW0iOjAuOTMsInNvbGlkRmFkZSI6MX19';
+
+const _f32b = new Float32Array(1), _u32b = new Uint32Array(_f32b.buffer);
+const f32 = x => { _f32b[0] = x; return _f32b[0]; };
+const b32 = f => { _f32b[0] = f; return _u32b[0]; };
+const pcgJS = seed => { seed = (Math.imul(seed, 747796405) + 2891336453) | 0; let w = ((seed >>> ((seed >>> 28) + 4)) ^ seed) >>> 0; w = Math.imul(w, 277803737) >>> 0; return ((w >>> 22) ^ w) >>> 0; };
+const hashJS = (x, y) => pcgJS((b32(x) ^ pcgJS(b32(y))) >>> 0) / 0xffffffff;
+const hash4JS = (x, y) => [
+  hashJS(x, y),
+  hashJS(f32(-x + 5.0), f32(-y + 5.0)),
+  hashJS(f32(y - 100.0), f32(x - 100.0)),
+  hashJS(f32(-y + 25.0), f32(-x + 25.0)),
+];
+function randomOrganism(seed){
+  const rule = [];
+  for (let i = 0; i < 10; i++){
+    const j = i * 8;
+    const h0 = hashJS(seed, j);
+    const scale = f32(1 + f32(2 * f32(h0 * h0)));
+    rule.push(f32(f32(h0 * 2 - 1) * scale));
+    for (let k = 1; k < 4; k++) rule.push(f32(f32(hashJS(seed, j + k) * 2 - 1) * scale));
+    for (let k = 4; k < 8; k++) rule.push(f32(hashJS(seed, j + k) * 2 - 1));
+  }
+  return rule;
+}
+function mutateOrganism(rule, amount, cohortSeed){
+  const r = rule.slice();
+  const sx = f32(f32(r[32] + r[61]) + r[10]);
+  const sy = f32(f32(r[33] + r[60]) + r[11]);
+  const seed = f32(hashJS(sx, sy) + cohortSeed);
+  for (let i = 0; i < 10; i++){
+    const b = i * 8;
+    const h4 = hash4JS(f32(-0.5 + f32(-i + seed)), f32(-0.5 + i));
+    for (let k = 0; k < 4; k++) r[b + 4 + k] = f32(r[b + 4 + k] + f32(amount * f32(-1 + 2 * h4[k])));
+    const fq = f32(1 + f32(f32(amount * 0.5) * f32(hashJS(seed, i) - 0.5)));
+    for (let k = 0; k < 4; k++) r[b + k] = f32(r[b + k] * fq);
+  }
+  return r;
+}
+
+let cfg = null;
+const app = { paused:false, view:'particles', blend:'solid', brightness:0.5,
+              stepsPerFrame:1, simWorldSize:1.0, resetSeed:1,
+              hardPixels:false, accum:0.9, solidFade:0.998 };
+
+let C = null;
+const entityTex = [null,null], entityFBO = [null,null];
+const canvasTex = [null,null], canvasFBO = [null,null];
+const paintTex = [null,null], paintFBO = [null,null];
+let brushTex = null, brushFBO = null;
+let entityPing = 0, canvasPing = 0, paintPing = 0, frameCount = 0, ruleDirty = true;
+let progEntity, progBrush, progCanvas, progField, progSprite, progTonemap, progComp, progPresent;
+let quadVAO, brushVAO;
+let sceneBufTex = null, sceneBufFBO = null;
+let viewTex = null, viewFBO = null;
+const accumTex = [null, null], accumFBO = [null, null];
+let accumPing = 0;
+
+function computeConstants(){
+  const W = Math.max(2, Math.round(window.innerWidth));
+  const H = Math.max(2, Math.round(window.innerHeight));
+  const tex_scale = [1, 1];
+  const worldSize = app.simWorldSize;
+  const sqrtWorldSize = Math.sqrt(worldSize);
+  const entityCount = Math.floor(600000 * worldSize);
+  // Fluoddity-Core: CANVAS_DIM = 1024 * sqrt(world size); all distances are tuned against it.
+  const canvasWidth = Math.round(1024 * sqrtWorldSize), canvasHeight = canvasWidth;
+  const entityTexWidth = Math.ceil(Math.sqrt(entityCount));
+  const entityTexHeight = Math.ceil(entityCount / entityTexWidth);
+  return { W, H, tex_scale, worldSize, sqrtWorldSize, entityCount, canvasWidth, canvasHeight, entityTexWidth, entityTexHeight };
+}
+function floatTex(w, h, linear){
+  const t = gl.createTexture();
+  gl.bindTexture(gl.TEXTURE_2D, t);
+  gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA32F, w, h, 0, gl.RGBA, gl.FLOAT, null);
+  const filt = linear && floatLinear ? gl.LINEAR : gl.NEAREST;
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, filt);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, filt);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.REPEAT);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.REPEAT);
+  return t;
+}
+function screenTex(w, h){
+  const t = floatTex(w, h, true);
+  gl.bindTexture(gl.TEXTURE_2D, t);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+  return t;
+}
+function fboOf(tex){
+  const f = gl.createFramebuffer();
+  gl.bindFramebuffer(gl.FRAMEBUFFER, f);
+  gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_2D, tex, 0);
+  if (gl.checkFramebufferStatus(gl.FRAMEBUFFER) !== gl.FRAMEBUFFER_COMPLETE) fatal('Framebuffer incomplete');
+  gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+  return f;
+}
+function makeQuadVAO(){
+  const vao = gl.createVertexArray();
+  gl.bindVertexArray(vao);
+  const vbo = gl.createBuffer();
+  gl.bindBuffer(gl.ARRAY_BUFFER, vbo);
+  gl.bufferData(gl.ARRAY_BUFFER, new Float32Array([-1,-1, 1,-1, 1,1, -1,-1, 1,1, -1,1]), gl.STATIC_DRAW);
+  gl.enableVertexAttribArray(0);
+  gl.vertexAttribPointer(0, 2, gl.FLOAT, false, 0, 0);
+  gl.bindVertexArray(null);
+  return vao;
+}
+function makeBrushVAO(){
+  const vao = gl.createVertexArray();
+  gl.bindVertexArray(vao);
+  const vbo = gl.createBuffer();
+  gl.bindBuffer(gl.ARRAY_BUFFER, vbo);
+  gl.bufferData(gl.ARRAY_BUFFER, new Float32Array([-1,-1,0,0, 1,-1,1,0, 1,1,1,1, -1,1,0,1]), gl.STATIC_DRAW);
+  gl.enableVertexAttribArray(0); gl.vertexAttribPointer(0, 2, gl.FLOAT, false, 16, 0);
+  gl.enableVertexAttribArray(1); gl.vertexAttribPointer(1, 2, gl.FLOAT, false, 16, 8);
+  gl.bindVertexArray(null);
+  return vao;
+}
+function initGL(){
+  progEntity  = makeProgram(QUAD_VS, ENTITY_FS);
+  progBrush   = makeProgram(BRUSH_VS, BRUSH_FS);
+  progCanvas  = makeProgram(QUAD_VS, CANVAS_FS);
+  progField   = makeProgram(QUAD_VS, FIELD_FS);
+  progSprite  = makeProgram(SPRITE_VS, SPRITE_FS);
+  progTonemap = makeProgram(QUAD_VS, TONEMAP_FS);
+  progComp    = makeProgram(QUAD_VS, COMP_FS);
+  progPresent = makeProgram(QUAD_VS, PRESENT_FS);
+  quadVAO  = makeQuadVAO();
+  brushVAO = makeBrushVAO();
+}
+function destroyResources(){
+  for (let i = 0; i < 2; i++){
+    if (entityTex[i]){ gl.deleteTexture(entityTex[i]); gl.deleteFramebuffer(entityFBO[i]); }
+    if (canvasTex[i]){ gl.deleteTexture(canvasTex[i]); gl.deleteFramebuffer(canvasFBO[i]); }
+    if (paintTex[i]){ gl.deleteTexture(paintTex[i]); gl.deleteFramebuffer(paintFBO[i]); }
+  }
+  if (brushTex){ gl.deleteTexture(brushTex); gl.deleteFramebuffer(brushFBO); }
+  if (sceneBufTex){ gl.deleteTexture(sceneBufTex); gl.deleteFramebuffer(sceneBufFBO); sceneBufTex = null; sceneBufFBO = null; }
+  if (viewTex){ gl.deleteTexture(viewTex); gl.deleteFramebuffer(viewFBO); viewTex = null; viewFBO = null; }
+  for (let i = 0; i < 2; i++){
+    if (accumTex[i]){ gl.deleteTexture(accumTex[i]); gl.deleteFramebuffer(accumFBO[i]); accumTex[i] = null; accumFBO[i] = null; }
+  }
+  accumPing = 0;
+}
+function createResources(){
+  destroyResources();
+  C = computeConstants();
+  for (let i = 0; i < 2; i++){ entityTex[i] = floatTex(C.entityTexWidth, C.entityTexHeight, false); entityFBO[i] = fboOf(entityTex[i]); }
+  for (let i = 0; i < 2; i++){ canvasTex[i] = floatTex(C.canvasWidth, C.canvasHeight, true); canvasFBO[i] = fboOf(canvasTex[i]); }
+  for (let i = 0; i < 2; i++){ paintTex[i] = floatTex(C.canvasWidth, C.canvasHeight, true); paintFBO[i] = fboOf(paintTex[i]); }
+  paintPing = 0;
+  brushTex = floatTex(C.canvasWidth, C.canvasHeight, true);
+  brushFBO = fboOf(brushTex);
+  sceneBufTex = screenTex(C.canvasWidth, C.canvasHeight); sceneBufFBO = fboOf(sceneBufTex);
+  viewTex = screenTex(C.canvasWidth, C.canvasHeight); viewFBO = fboOf(viewTex);
+  for (let i = 0; i < 2; i++){ accumTex[i] = screenTex(C.canvasWidth, C.canvasHeight); accumFBO[i] = fboOf(accumTex[i]); }
+  entityPing = 0; canvasPing = 0; frameCount = 0; ruleDirty = true; accumPing = 0;
+}
+
+function setConfigUniforms(p){
+  u4f(p, 'config_a', [cfg.cohorts, cfg.rule_seed, cfg.sensor_gain, cfg.sensor_angle]);
+  u4f(p, 'config_b', [cfg.sensor_distance, cfg.mutation_scale, cfg.global_force_mult, cfg.drag]);
+  u4f(p, 'config_c', [cfg.strafe_power, cfg.axial_force, cfg.lateral_force, cfg.hazard_rate]);
+}
+function setRuleUniforms(p){
+  if (!ruleDirty) return;
+  for (let i = 0; i < 10; i++){
+    const b = i * 8;
+    u4f(p, 'config_rule.centers[' + i + '].frequency', cfg.rule.slice(b, b + 4));
+    u4f(p, 'config_rule.centers[' + i + '].amplitude', cfg.rule.slice(b + 4, b + 8));
+  }
+  ruleDirty = false;
+}
+function createBrush(){
+  const p = progBrush;
+  gl.useProgram(p);
+  gl.bindFramebuffer(gl.FRAMEBUFFER, brushFBO);
+  gl.viewport(0, 0, C.canvasWidth, C.canvasHeight);
+  gl.clearColor(0, 0, 0, 0); gl.clear(gl.COLOR_BUFFER_BIT);
+  gl.enable(gl.BLEND); gl.blendFunc(gl.SRC_ALPHA, gl.ONE);
+  bindTex(0, entityTex[entityPing], p, 'entity_texture');
+  u1i(p, 'entity_tex_width', C.entityTexWidth);
+  u1f(p, 'sqrt_world_size', C.sqrtWorldSize);
+  u2f(p, 'tex_scale', C.tex_scale);
+  u1i(p, 'frame_count', frameCount);
+  gl.bindVertexArray(brushVAO);
+  gl.drawArraysInstanced(gl.TRIANGLE_FAN, 0, 4, C.entityCount);
+  gl.disable(gl.BLEND);
+}
+function updateEntities(){
+  const p = progEntity, r = entityPing, w = 1 - r;
+  gl.useProgram(p);
+  gl.bindFramebuffer(gl.FRAMEBUFFER, entityFBO[w]);
+  gl.viewport(0, 0, C.entityTexWidth, C.entityTexHeight);
+  bindTex(0, entityTex[r], p, 'entity_texture');
+  bindTex(1, canvasTex[canvasPing], p, 'canvas_texture');
+  setConfigUniforms(p);
+  setRuleUniforms(p);
+  u1i(p, 'initial_conditions', cfg.initial_conditions);
+  u1f(p, 'u_reset_seed', app.resetSeed);
+  u1f(p, 'sqrt_world_size', C.sqrtWorldSize);
+  u2f(p, 'tex_scale', C.tex_scale);
+  u1i(p, 'frame_count', frameCount);
+  u1i(p, 'entity_count', C.entityCount);
+  u1i(p, 'entity_tex_width', C.entityTexWidth);
+  gl.bindVertexArray(quadVAO);
+  gl.drawArrays(gl.TRIANGLES, 0, 6);
+  entityPing = w;
+}
+// One shader drives both diffusing layers: the flow field (sensed) and the paint (displayed in field view).
+function updateLayer(tex, fbo, ping, persistence, gain){
+  const p = progCanvas, w = 1 - ping;
+  gl.bindFramebuffer(gl.FRAMEBUFFER, fbo[w]);
+  bindTex(1, tex[ping], p, 'canvas_texture');
+  u2f(p, 'persistence_diffusion', [persistence, cfg.trail_diffusion]);
+  u1f(p, 'paint_gain', gain);
+  gl.drawArrays(gl.TRIANGLES, 0, 6);
+  return w;
+}
+function advance(){
+  createBrush();
+  updateEntities();
+  const p = progCanvas;
+  gl.useProgram(p);
+  gl.viewport(0, 0, C.canvasWidth, C.canvasHeight);
+  gl.bindVertexArray(quadVAO);
+  bindTex(0, brushTex, p, 'brush_texture');
+  u1i(p, 'frame_count', frameCount);
+  const tp = Math.min(cfg.trail_persistence, 0.999);
+  canvasPing = updateLayer(canvasTex, canvasFBO, canvasPing, tp, 1 - tp);   // Fluoddity mix: equilibrium independent of persistence
+  paintPing  = updateLayer(paintTex,  paintFBO,  paintPing,  cfg.paint_persistence, cfg.paint_gain);
+  frameCount++;
+}
+function spritePass(target){
+  const p = progSprite, solid = app.view === 'particles' && app.blend === 'solid';
+  gl.useProgram(p);
+  gl.bindFramebuffer(gl.FRAMEBUFFER, target);
+  gl.viewport(0, 0, C.canvasWidth, C.canvasHeight);
+  gl.clearColor(0, 0, 0, 0); gl.clear(gl.COLOR_BUFFER_BIT);
+  bindTex(0, entityTex[entityPing], p, 'entity_texture');
+  u1i(p, 'entity_tex_width', C.entityTexWidth);
+  u1i(p, 'entity_count', C.entityCount);
+  u1i(p, 'cohorts', cfg.cohorts);
+  u1f(p, 'sqrt_world_size', C.sqrtWorldSize);
+  u2f(p, 'tex_scale', C.tex_scale);
+  u1f(p, 'brightness', app.brightness);
+  u1f(p, 'u_hard', app.hardPixels ? 1 : 0);
+  u1f(p, 'u_solid', solid ? 1 : 0);
+  u1f(p, 'u_time', performance.now() * 0.001);
+  gl.enable(gl.BLEND);
+  // solid: premultiplied rgb + true coverage alpha (alpha was previously squared, then re-multiplied in COMP)
+  if (solid) gl.blendFuncSeparate(gl.SRC_ALPHA, gl.ONE_MINUS_SRC_ALPHA, gl.ONE, gl.ONE_MINUS_SRC_ALPHA);
+  else gl.blendFunc(gl.SRC_ALPHA, gl.ONE);
+  gl.bindVertexArray(brushVAO);
+  gl.drawArraysInstanced(gl.TRIANGLE_FAN, 0, 4, C.entityCount);
+  gl.disable(gl.BLEND);
+}
+function tonemapPass(sourceTex, u_tone){
+  const p = progTonemap;
+  gl.useProgram(p);
+  bindTex(0, sourceTex, p, 'source_tex');
+  u1f(p, 'u_tone', u_tone);
+  gl.bindFramebuffer(gl.FRAMEBUFFER, viewFBO);
+  gl.viewport(0, 0, C.canvasWidth, C.canvasHeight);
+  gl.bindVertexArray(quadVAO);
+  gl.drawArrays(gl.TRIANGLES, 0, 6);
+}
+// Integer scale + integer offset of the square sim inside the window (GL bottom-left origin).
+function viewportMap(){
+  const W = gl.drawingBufferWidth, H = gl.drawingBufferHeight, N = C.canvasWidth;
+  const k = Math.max(1, Math.floor(Math.min(W, H) / N));
+  return { k, ox: Math.floor((W - N * k) / 2), oy: Math.floor((H - N * k) / 2), W, H, N };
+}
+function presentPass(){
+  const p = progPresent;
+  gl.useProgram(p);
+  bindTex(0, viewTex, p, 'tex');
+  const v = viewportMap();
+  gl.uniform2i(loc(p, 'offset'), v.ox, v.oy);
+  gl.uniform1i(loc(p, 'scale'), v.k);
+  gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+  gl.viewport(0, 0, gl.drawingBufferWidth, gl.drawingBufferHeight);
+  gl.bindVertexArray(quadVAO);
+  gl.drawArrays(gl.TRIANGLES, 0, 6);
+}
+function clearAccum(){
+  for (let i = 0; i < 2; i++){
+    gl.bindFramebuffer(gl.FRAMEBUFFER, accumFBO[i]);
+    gl.clearColor(0, 0, 0, 1); gl.clear(gl.COLOR_BUFFER_BIT);
+  }
+  gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+  accumPing = 0;
+}
+function resetSim(seed){
+  frameCount = 0;
+  app.resetSeed = typeof seed === 'number' ? seed : Math.random() * 1000;
+  clearAccum();
+  for (let i = 0; i < 2; i++){
+    gl.bindFramebuffer(gl.FRAMEBUFFER, paintFBO[i]);
+    gl.clearColor(0, 0, 0, 1); gl.clear(gl.COLOR_BUFFER_BIT);
+  }
+  gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+  paintPing = 0;
+}
+function render(){
+  const solid = app.view === 'particles' && app.blend === 'solid';
+  let sceneTex = sceneBufTex;
+  if (app.view === 'particles'){
+    spritePass(sceneBufFBO);
+  } else {
+    const p = progField;
+    gl.useProgram(p);
+    bindTex(0, paintTex[paintPing], p, 'tex');
+    u1f(p, 'brightness', app.brightness);
+    u1f(p, 'u_hard', app.hardPixels ? 1 : 0);
+    gl.bindFramebuffer(gl.FRAMEBUFFER, sceneBufFBO);
+    gl.viewport(0, 0, C.canvasWidth, C.canvasHeight);
+    gl.bindVertexArray(quadVAO);
+    gl.drawArrays(gl.TRIANGLES, 0, 6);
+  }
+  if (!app.paused && app.accum > 0.002){
+    const p = progComp;
+    gl.useProgram(p);
+    const r = accumPing, wr = 1 - r;
+    bindTex(0, sceneTex, p, 'view_tex');
+    bindTex(1, accumTex[r], p, 'accum_tex');
+    u1f(p, 'accum_amount', app.accum);
+    u1f(p, 'u_solid', solid ? 1 : 0);
+    u1f(p, 'u_fade', app.solidFade);
+    gl.bindFramebuffer(gl.FRAMEBUFFER, accumFBO[wr]);
+    gl.viewport(0, 0, C.canvasWidth, C.canvasHeight);
+    gl.bindVertexArray(quadVAO);
+    gl.drawArrays(gl.TRIANGLES, 0, 6);
+    accumPing = wr;
+    sceneTex = accumTex[wr];
+  }
+  tonemapPass(sceneTex, solid ? 0 : 1);
+  presentPass();
+}
+
+function applyPreset(name){
+  const d = PRESETS[name];
+  cfg = {
+    cohorts: d.settings.num_cohorts, rule_seed: d.settings.rule_seed,
+    sensor_gain: d.physics.sensor_gain, sensor_angle: d.physics.sensor_angle,
+    sensor_distance: d.physics.sensor_distance, mutation_scale: d.physics.mutation_scale,
+    global_force_mult: d.physics.global_force_mult, drag: d.physics.drag,
+    strafe_power: d.physics.strafe_power, axial_force: d.physics.axial_force,
+    lateral_force: d.physics.lateral_force, hazard_rate: d.physics.hazard_rate,
+    trail_persistence: d.physics.trail_persistence, trail_diffusion: d.physics.trail_diffusion,
+    paint_gain: 1 - d.physics.trail_persistence,
+    paint_persistence: 1.0,
+    initial_conditions: d.settings.initial_conditions|0, rule: d.rule.slice(),
+  };
+  ruleDirty = true;
+  frameCount = 0;
+  clearAccum();
+  syncUI();
+}
+function newOrganism(){
+  const seed = f32(Math.random() * 1000);
+  cfg.rule = randomOrganism(seed);
+  cfg.rule_seed = seed;
+  ruleDirty = true;
+  resetSim();
+}
+function mutate(){
+  cfg.rule = mutateOrganism(cfg.rule, 0.15 * (0.5 + cfg.mutation_scale), Math.random() * 1000);
+  ruleDirty = true;
+}
+function setPaused(v){ app.paused = v; $('bPause').textContent = v ? 'resume' : 'pause'; $('bPause').classList.toggle('on', v); }
+function setView(v){ if (v !== app.view){ app.view = v; clearAccum(); } $('bView').textContent = 'view: ' + v; }
+function setHard(v){ app.hardPixels = v; $('bHard').classList.toggle('on', v); }
+function setBlend(v){ if (app.blend !== v){ app.blend = v; clearAccum(); } $('bBlend').textContent = 'blend: ' + v; $('bBlend').classList.toggle('on', v === 'solid'); }
+
+const sliderMeta = {};
+function setAppSlider(key, v){
+  if (key === '__brightness') app.brightness = v;
+  else if (key === '__steps') app.stepsPerFrame = v|0;
+  else if (key === '__accum') app.accum = v;
+  else if (key === '__solidFade') app.solidFade = v;
+}
+function appVal(key){
+  return key === '__brightness' ? app.brightness : key === '__steps' ? app.stepsPerFrame
+       : key === '__accum' ? app.accum : key === '__solidFade' ? app.solidFade : cfg[key];
+}
+function addSlider(parent, key, label, min, max, step, fmt){
+  const row = document.createElement('div'); row.className = 'row';
+  const lab = document.createElement('label'); lab.textContent = label;
+  const inp = document.createElement('input'); inp.type = 'range'; inp.min = min; inp.max = max; inp.step = step;
+  const out = document.createElement('output');
+  row.append(lab, inp, out); parent.appendChild(row);
+  const refresh = v => { inp.value = v; out.textContent = fmt(v); };
+  inp.addEventListener('input', () => {
+    const v = parseFloat(inp.value);
+    if (key.startsWith('__')) setAppSlider(key, v); else cfg[key] = v;
+    out.textContent = fmt(v);
+  });
+  sliderMeta[key] = { refresh };
+  return refresh;
+}
+
+initGL();
+createResources();
+
+window.addEventListener('keydown', e => {
+  if (e.target.tagName === 'INPUT' || e.target.tagName === 'SELECT') return;
+  const k = e.key.toLowerCase();
+  if (k === ' '){ setPaused(!app.paused); e.preventDefault(); }
+  else if (k === 'r') resetSim();
+  else if (k === 'n') newOrganism();
+  else if (k === 'm') mutate();
+  else if (k === 'h') $('panel').classList.toggle('hidden');
+  else if (k === 'f') setView(app.view === 'particles' ? 'field' : 'particles');
+  else if (k === 'p') setHard(!app.hardPixels);
+  else if (k === 'b') setBlend(app.blend === 'solid' ? 'additive' : 'solid');
+});
+
+$('bPause').onclick = () => setPaused(!app.paused);
+$('bReset').onclick = resetSim;
+$('bNew').onclick = newOrganism;
+$('bMutate').onclick = mutate;
+$('bView').onclick = () => setView(app.view === 'particles' ? 'field' : 'particles');
+$('bHard').onclick = () => setHard(!app.hardPixels);
+$('bBlend').onclick = () => setBlend(app.blend === 'solid' ? 'additive' : 'solid');
+setBlend(app.blend);
+function serializeState(){
+  return { c: {...cfg, rule: Array.from(cfg.rule)},
+           a: {view: app.view, blend: app.blend, brightness: app.brightness, simWorldSize: app.simWorldSize,
+               stepsPerFrame: app.stepsPerFrame, hard: app.hardPixels, accum: app.accum, solidFade: app.solidFade,
+               seed: app.resetSeed} };
+}
+function encodeState(obj){ return btoa(String.fromCharCode(...new TextEncoder().encode(JSON.stringify(obj)))); }
+function decodeState(b64){ return JSON.parse(new TextDecoder().decode(Uint8Array.from(atob(decodeURIComponent(b64)), ch => ch.charCodeAt(0)))); }
+function flashButton(btn, text){ const old = btn.textContent; btn.textContent = text; setTimeout(() => btn.textContent = old, 1200); }
+$('bShare').onclick = () => {
+  history.replaceState(null, '', '#c=' + encodeState(serializeState()));
+  navigator.clipboard?.writeText(location.href).catch(() => {});
+  flashButton($('bShare'), 'link copied!');
+};
+
+const secPhys = $('secPhysics'), secField = $('secField');
+const PHYS_SLIDERS = [
+  ['sensor_angle','sensor angle',-1,1,0.001, v => (v*180).toFixed(1) + '\u00b0'],
+  ['sensor_distance','sensor dist',-2,3,0.01, v => v.toFixed(2)],
+  ['sensor_gain','sensor gain',0,10,0.01, v => v.toFixed(2)],
+  ['global_force_mult','force',-1,2,0.01, v => v.toFixed(2)],
+  ['axial_force','axial',-1,1,0.001, v => v.toFixed(3)],
+  ['lateral_force','lateral',-2,1,0.001, v => v.toFixed(3)],
+  ['drag','drag',-1,1,0.001, v => v.toFixed(3)],
+  ['strafe_power','strafe',0,0.5,0.001, v => v.toFixed(3)],
+  ['mutation_scale','mutation',0,1,0.005, v => v.toFixed(3)],
+  ['hazard_rate','hazard',0,0.05,0.0005, v => v.toFixed(4)],
+];
+const FIELD_SLIDERS = [
+  ['trail_persistence','persistence',0,1,0.001, v => v.toFixed(3)],
+  ['paint_gain','paint gain',0,0.2,0.001, v => v.toFixed(3)],
+  ['paint_persistence','paint fade',0,1,0.001, v => v.toFixed(3)],
+  ['trail_diffusion','diffusion',0,1,0.001, v => v.toFixed(3)],
+  ['__brightness','brightness',0.2,3,0.01, v => v.toFixed(2)],
+  ['__steps','steps/frame',1,8,1, v => v.toFixed(0)],
+  ['__accum','accumulation',0,1,0.01, v => v.toFixed(2)],
+  ['__solidFade','solid fade',0.9,1,0.001, v => v.toFixed(3)],
+];
+for (const s of PHYS_SLIDERS) addSlider(secPhys, ...s);
+for (const s of FIELD_SLIDERS) addSlider(secField, ...s);
+
+const selPreset = $('selPreset');
+for (const name of Object.keys(PRESETS)) selPreset.append(new Option(name, name));
+selPreset.onchange = () => applyPreset(selPreset.value);
+const selInit = $('selInit');
+selInit.onchange = () => { cfg.initial_conditions = parseInt(selInit.value); resetSim(); };
+const selQuality = $('selQuality');
+selQuality.value = String(app.simWorldSize);
+selQuality.onchange = () => { app.simWorldSize = parseFloat(selQuality.value); createResources(); calibrateSpeed(); };
+const sCohorts = $('sCohorts'), oCohorts = $('oCohorts');
+sCohorts.addEventListener('input', () => { cfg.cohorts = parseInt(sCohorts.value); oCohorts.textContent = cfg.cohorts; });
+
+const _syncBuf = new Float32Array(4);
+function calibrateSpeed(){
+  const times = [];
+  for (let i = 0; i < 7; i++){
+    const t0 = performance.now();
+    advance();
+    gl.bindFramebuffer(gl.FRAMEBUFFER, canvasFBO[canvasPing]);
+    gl.readPixels(0, 0, 1, 1, gl.RGBA, gl.FLOAT, _syncBuf);
+    gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+    if (i >= 2) times.push(performance.now() - t0);
+  }
+  times.sort((a, b) => a - b);
+  const ft = Math.max(times[Math.floor(times.length/2)], 0.1);
+  app.stepsPerFrame = Math.max(1, Math.min(8, Math.floor(15/ft)));
+  if (sliderMeta['__steps']) sliderMeta['__steps'].refresh(app.stepsPerFrame);
+}
+
+applyPreset('HungryHungryHippos');
+calibrateSpeed();
+
+function syncUI(){
+  sCohorts.value = cfg.cohorts; oCohorts.textContent = cfg.cohorts;
+  selInit.value = String(cfg.initial_conditions|0);
+  selQuality.value = String(app.simWorldSize);
+  for (const key of Object.keys(sliderMeta)){
+    const v = appVal(key);
+    if (typeof v === 'number') sliderMeta[key].refresh(v);
+  }
+}
+
+function applyState(s){
+  if (!s || typeof s !== 'object') return false;
+  const c = (s.c && typeof s.c === 'object') ? s.c : (typeof s.cohorts === 'number' ? s : null);
+  if (c) for (const k in cfg) if (k in c && !k.startsWith('__')) cfg[k] = c[k];
+  const a = s.a || {};
+  const ws = a.simWorldSize ?? 1;
+  if (ws !== app.simWorldSize){ app.simWorldSize = ws; createResources(); }
+  app.brightness = a.brightness ?? 0.5;
+  app.stepsPerFrame = a.stepsPerFrame ?? app.stepsPerFrame;
+  app.accum = a.accum ?? 0.9;
+  app.solidFade = a.solidFade ?? 0.998;
+  setView(a.view === 'field' ? 'field' : 'particles');
+  setHard(!!a.hard);
+  setBlend(a.blend === 'additive' ? 'additive' : 'solid');
+  ruleDirty = true;
+  resetSim(a.seed);
+  syncUI();
+  return true;
+}
+function loadState(b64){
+  try { return applyState(decodeState(b64)); }
+  catch (e) { console.warn('bad state link', e); return false; }
+}
+$('bSave').onclick = () => {
+  const blob = new Blob([JSON.stringify(serializeState(), null, 2)], {type:'application/json'});
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.href = url; a.download = 'hypercells-' + Date.now() + '.json';
+  a.click();
+  setTimeout(() => URL.revokeObjectURL(url), 0);
+  flashButton($('bSave'), 'saved!');
+};
+const fileLoad = $('fileLoad');
+$('bLoad').onclick = () => fileLoad.click();
+fileLoad.addEventListener('change', () => {
+  const f = fileLoad.files && fileLoad.files[0];
+  if (!f) return;
+  const rd = new FileReader();
+  rd.onload = () => {
+    try {
+      if (applyState(JSON.parse(rd.result))){
+        history.replaceState(null, '', '#c=' + encodeState(serializeState()));
+        flashButton($('bLoad'), 'loaded!');
+      } else flashButton($('bLoad'), 'bad file');
+    } catch (e) { console.warn('bad json config', e); flashButton($('bLoad'), 'bad file'); }
+  };
+  rd.onerror = () => flashButton($('bLoad'), 'read error');
+  rd.readAsText(f);
+  fileLoad.value = '';
+});
+loadState((location.hash.match(/#c=(.+)/) || [null, DEFAULT_STATE])[1]);
+window.addEventListener('hashchange', () => { const m = location.hash.match(/#c=(.+)/); if (m) loadState(m[1]); });
+let fpsEMA = 60, frameLast = 0;
+function frame(now){
+  const dt = now - frameLast; frameLast = now;
+  if (dt > 0 && dt < 1000) fpsEMA = fpsEMA * 0.95 + (1000/dt) * 0.05;
+  if (!app.paused){
+    const n = app.stepsPerFrame|0;
+    for (let i = 0; i < n; i++) advance();
+  }
+  render();
+  $('hud').textContent = fpsEMA.toFixed(0) + ' fps \u00b7 ' + (C.entityCount/1e6).toFixed(2) + 'M particles \u00b7 field ' + C.canvasWidth + '\u00d7' + C.canvasHeight + (app.paused ? ' \u00b7 PAUSED' : '');
+requestAnimationFrame(frame);
+
+}
+requestAnimationFrame(frame);
+
+</script>
+</body>
+</html>
