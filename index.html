@@ -56,7 +56,7 @@ paint/flow layer.
   <div class="btns">
     <button id="bPause">pause</button><button id="bReset">reset</button><button id="bNew">new</button>
     <button id="bMutate">mutate</button><button id="bView">view: particles</button>
-    <button id="bHard">hard px</button><button id="bBlend">blend: solid</button>
+    <button id="bHard">hard px</button><button id="bBlend">blend: solid</button><button id="bAuto">auto: off</button>
   </div>
   <div class="sec"><h4>Organism</h4>
     <div class="row"><label>presets</label><select id="selPreset" style="grid-column:2/4"></select></div>
@@ -73,7 +73,8 @@ paint/flow layer.
     <button id="bSave">save json</button><button id="bLoad" style="grid-column:2/4">load json</button>
   </div>
   <input type="file" id="fileLoad" accept="application/json,.json" style="display:none">
-  <div class="hint"><b>space</b> pause &nbsp;· <b>r</b> reset &nbsp;· <b>n</b> new organism &nbsp;· <b>m</b> mutate &nbsp;· <b>f</b> field view &nbsp;· <b>p</b> hard pixels &nbsp;· <b>b</b> blend mode &nbsp;· <b>h</b> hide panel.</div>
+  <input type="file" id="dirLoad" webkitdirectory multiple style="display:none">
+  <div class="hint"><b>space</b> pause &nbsp;· <b>r</b> reset &nbsp;· <b>n</b> new organism &nbsp;· <b>m</b> mutate &nbsp;· <b>f</b> field view &nbsp;· <b>p</b> hard pixels &nbsp;· <b>b</b> blend mode &nbsp;· <b>a</b> auto &nbsp;· <b>h</b> hide panel.</div>
 </div>
 <div id="hud"></div>
 <div id="err"></div>
@@ -533,6 +534,16 @@ let cfg = null;
 const app = { paused:false, view:'particles', blend:'solid', brightness:0.5,
               stepsPerFrame:1, simWorldSize:1.0, resetSeed:1,
               hardPixels:false, accum:0.9, solidFade:0.998 };
+// Auto-mode: hold each config for AUTO_DWELL seconds, then crossfade into the next one over
+// AUTO_FADE seconds, cycling the config/ files in a random order. Overridable via ?dwell=&fade=.
+const _q = new URLSearchParams(location.search);
+const AUTO_DWELL = Math.max(1, +_q.get('dwell') || 120);
+const AUTO_FADE  = Math.max(0.5, +_q.get('fade') || 10);
+const auto = { on:false, configs:[], cur:-1, next:-1, mode:'dwell', t:0, from:null, to:null, bag:[], last:-1 };
+// Continuous physics keys that get interpolated during a crossfade (rule is handled separately).
+const CFG_KEYS = ['cohorts','rule_seed','sensor_gain','sensor_angle','sensor_distance','mutation_scale',
+                  'global_force_mult','drag','strafe_power','axial_force','lateral_force','hazard_rate',
+                  'trail_persistence','trail_diffusion','paint_gain','paint_persistence'];
 
 let C = null;
 const entityTex = [null,null], entityFBO = [null,null];
@@ -906,6 +917,7 @@ window.addEventListener('keydown', e => {
   else if (k === 'f') setView(app.view === 'particles' ? 'field' : 'particles');
   else if (k === 'p') setHard(!app.hardPixels);
   else if (k === 'b') setBlend(app.blend === 'solid' ? 'additive' : 'solid');
+  else if (k === 'a') toggleAuto();
 });
 
 $('bPause').onclick = () => setPaused(!app.paused);
@@ -915,6 +927,7 @@ $('bMutate').onclick = mutate;
 $('bView').onclick = () => setView(app.view === 'particles' ? 'field' : 'particles');
 $('bHard').onclick = () => setHard(!app.hardPixels);
 $('bBlend').onclick = () => setBlend(app.blend === 'solid' ? 'additive' : 'solid');
+$('bAuto').onclick = toggleAuto;
 setBlend(app.blend);
 function serializeState(){
   return { c: {...cfg, rule: Array.from(cfg.rule)},
@@ -1050,6 +1063,128 @@ fileLoad.addEventListener('change', () => {
 });
 loadState((location.hash.match(/#c=(.+)/) || [null, DEFAULT_STATE])[1]);
 window.addEventListener('hashchange', () => { const m = location.hash.match(/#c=(.+)/); if (m) loadState(m[1]); });
+// ---- auto-mode ---------------------------------------------------------------
+function normalizeConfig(s){                       // fill a {c,a} config from the current state
+  const cIn = (s && typeof s.c === 'object' && s.c) || (s && typeof s.cohorts === 'number' ? s : {});
+  const aIn = (s && typeof s.a === 'object' && s.a) || {};
+  const c = {};
+  for (const k of CFG_KEYS) c[k] = Number.isFinite(cIn[k]) ? cIn[k] : cfg[k];
+  c.initial_conditions = Number.isFinite(cIn.initial_conditions) ? (cIn.initial_conditions | 0) : (cfg.initial_conditions | 0);
+  c.rule = (Array.isArray(cIn.rule) && cIn.rule.length === 80) ? cIn.rule.slice() : Array.from(cfg.rule);
+  return { c, a: {
+    view: aIn.view === 'field' ? 'field' : 'particles',
+    blend: aIn.blend === 'additive' ? 'additive' : 'solid',
+    hard: !!aIn.hard,
+    brightness: Number.isFinite(aIn.brightness) ? aIn.brightness : app.brightness,
+    accum: Number.isFinite(aIn.accum) ? aIn.accum : app.accum,
+    solidFade: Number.isFinite(aIn.solidFade) ? aIn.solidFade : app.solidFade } };
+}
+function applyConfig(n){                           // snap straight to a config (no restart, no reset)
+  for (const k of CFG_KEYS) cfg[k] = n.c[k];
+  cfg.initial_conditions = n.c.initial_conditions;
+  cfg.rule = n.c.rule.slice();
+  ruleDirty = true;
+  app.brightness = n.a.brightness; app.accum = n.a.accum; app.solidFade = n.a.solidFade;
+  setView(n.a.view); setHard(n.a.hard); setBlend(n.a.blend);
+  syncUI();
+}
+function blendConfigs(A, B, u){                    // interpolate continuous values only; u in [0,1]
+  for (const k of CFG_KEYS) cfg[k] = A.c[k] + (B.c[k] - A.c[k]) * u;
+  cfg.cohorts = Math.round(cfg.cohorts);
+  const r = new Array(80);
+  for (let i = 0; i < 80; i++) r[i] = A.c.rule[i] + (B.c.rule[i] - A.c.rule[i]) * u;
+  cfg.rule = r;
+  ruleDirty = true;
+  app.brightness = A.a.brightness + (B.a.brightness - A.a.brightness) * u;
+  app.accum = A.a.accum + (B.a.accum - A.a.accum) * u;
+  app.solidFade = A.a.solidFade + (B.a.solidFade - A.a.solidFade) * u;
+}
+function bagNext(){                                // shuffled bag, never repeating the previous pick
+  if (!auto.bag.length){
+    auto.bag = [...auto.configs.keys()];
+    for (let i = auto.bag.length - 1; i > 0; i--){ const j = Math.floor(Math.random() * (i + 1)); const t = auto.bag[i]; auto.bag[i] = auto.bag[j]; auto.bag[j] = t; }
+    if (auto.bag.length > 1 && auto.bag[0] === auto.last){ const t = auto.bag[0]; auto.bag[0] = auto.bag[1]; auto.bag[1] = t; }
+  }
+  auto.last = auto.bag.shift();
+  return auto.last;
+}
+function setAuto(on){
+  auto.on = on;
+  $('bAuto').textContent = 'auto: ' + (on ? 'on' : 'off');
+  $('bAuto').classList.toggle('on', on);
+  if (on){
+    auto.bag = []; auto.last = -1;
+    auto.cur = bagNext();
+    applyConfig(auto.configs[auto.cur]);
+    auto.mode = 'dwell'; auto.t = 0;
+  }
+}
+function autoStep(dtms){
+  if (!auto.on || auto.configs.length < 2) return;
+  auto.t += dtms / 1000;
+  if (auto.mode === 'dwell'){
+    if (auto.t < AUTO_DWELL) return;
+    auto.from = normalizeConfig(serializeState());
+    auto.next = bagNext();
+    auto.to = auto.configs[auto.next];
+    setView(auto.to.a.view); setHard(auto.to.a.hard); setBlend(auto.to.a.blend);
+    auto.mode = 'fade'; auto.t = 0;
+  } else {
+    const u = Math.min(1, auto.t / AUTO_FADE);
+    blendConfigs(auto.from, auto.to, u * u * (3 - 2 * u));
+    if (auto.t >= AUTO_FADE){
+      auto.cur = auto.next;
+      applyConfig(auto.to);
+      auto.mode = 'dwell'; auto.t = 0;
+    }
+  }
+}
+async function loadConfigList(){                   // http(s): read config/manifest.json + the files it lists
+  try {
+    const r = await fetch('config/manifest.json', {cache:'no-store'});
+    if (!r.ok) return null;
+    const names = await r.json();
+    if (!Array.isArray(names)) return null;
+    const out = [];
+    for (const n of names){
+      const rr = await fetch('config/' + n, {cache:'no-store'});
+      if (rr.ok){ try { out.push(normalizeConfig(await rr.json())); } catch (e) { /* skip malformed file */ } }
+    }
+    return out.length ? out : null;
+  } catch (e) { return null; }
+}
+async function toggleAuto(){
+  if (auto.on){ setAuto(false); return; }
+  if (!auto.configs.length){
+    $('bAuto').textContent = 'auto: loading';
+    const list = await loadConfigList();
+    if (list){ auto.configs = list; setAuto(true); return; }
+    $('bAuto').textContent = 'auto: pick config/';
+    $('dirLoad').click();                          // file:// blocks fetch: choose the config folder instead
+    setTimeout(() => { if (!auto.on && !auto.configs.length) $('bAuto').textContent = 'auto: off'; }, 6000);
+    return;
+  }
+  setAuto(true);
+}
+$('dirLoad').addEventListener('change', () => {
+  const files = [...$('dirLoad').files].filter(f => /\.json$/i.test(f.name) && f.name.toLowerCase() !== 'manifest.json');
+  if (!files.length) return;
+  Promise.all(files.map(f => f.text().then(t => normalizeConfig(JSON.parse(t))).catch(() => null)))
+    .then(list => {
+      const good = list.filter(Boolean);
+      if (!good.length){ $('bAuto').textContent = 'auto: no configs'; return; }
+      auto.configs = good;
+      setAuto(true);
+    });
+  $('dirLoad').value = '';
+});
+function autoHud(){
+  if (!auto.on) return '';
+  const left = auto.mode === 'dwell' ? AUTO_DWELL - auto.t : AUTO_FADE - auto.t;
+  return ' \u00b7 auto ' + (auto.cur + 1) + '/' + auto.configs.length +
+         (auto.mode === 'fade' ? ' \u2192 ' + (auto.next + 1) : '') + ' ' + Math.max(0, left).toFixed(0) + 's';
+}
+
 let fpsEMA = 60, frameLast = 0;
 function frame(now){
   const dt = now - frameLast; frameLast = now;
@@ -1057,9 +1192,10 @@ function frame(now){
   if (!app.paused){
     const n = app.stepsPerFrame|0;
     for (let i = 0; i < n; i++) advance();
+    autoStep(Math.min(dt, 100));
   }
   render();
-  $('hud').textContent = fpsEMA.toFixed(0) + ' fps \u00b7 ' + (C.entityCount/1e6).toFixed(2) + 'M particles \u00b7 field ' + C.canvasWidth + '\u00d7' + C.canvasHeight + (app.paused ? ' \u00b7 PAUSED' : '');
+  $('hud').textContent = fpsEMA.toFixed(0) + ' fps \u00b7 ' + (C.entityCount/1e6).toFixed(2) + 'M particles \u00b7 field ' + C.canvasWidth + '\u00d7' + C.canvasHeight + (app.paused ? ' \u00b7 PAUSED' : '') + autoHud();
 requestAnimationFrame(frame);
 
 }
