@@ -1122,8 +1122,12 @@ function setAuto(on){
     auto.seed = cfg.rule_seed;                       // keep the organism seed: every config morphs from the same base
     auto.cur = bagNext();
     auto.next = auto.cur;
-    auto.from = normalizeConfig(serializeState());   // crossfade in from whatever is on screen (no snap)
     auto.to = auto.configs[auto.cur];
+    if (auto.configs.length < 2){                    // nothing to cycle: just switch to it
+      applyConfig(auto.to); auto.mode = 'dwell'; auto.t = 0;
+      return;
+    }
+    auto.from = normalizeConfig(serializeState());   // crossfade in from whatever is on screen (no snap)
     auto.mode = 'fade'; auto.t = 0;
   }
 }
