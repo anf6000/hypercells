@@ -537,6 +537,8 @@ const app = { paused:false, view:'particles', blend:'solid', brightness:0.5,
               hardPixels:false, accum:0.9, solidFade:0.998 };
 // Auto-mode: hold each config for AUTO_DWELL seconds, then crossfade into the next one over
 // AUTO_FADE seconds, cycling the config/ files in a random order. Overridable via ?dwell=&fade=.
+// Enabling it crossfades in from the current view (no snap) and the organism seed stays fixed,
+// so physics + brightness + colour morph continuously from one config into the next.
 const _q = new URLSearchParams(location.search);
 const AUTO_DWELL = Math.max(1, +_q.get('dwell') || 120);
 const AUTO_FADE  = Math.max(0.5, +_q.get('fade') || 10);
@@ -1082,6 +1084,7 @@ function normalizeConfig(s){                       // fill a {c,a} config from t
 }
 function applyConfig(n){                           // snap straight to a config (no restart, no reset)
   for (const k of CFG_KEYS) cfg[k] = n.c[k];
+  if (typeof auto.seed === 'number') cfg.rule_seed = auto.seed;   // seed stays fixed across configs
   cfg.initial_conditions = n.c.initial_conditions;
   cfg.rule = n.c.rule.slice();
   ruleDirty = true;
@@ -1091,6 +1094,7 @@ function applyConfig(n){                           // snap straight to a config 
 }
 function blendConfigs(A, B, u){                    // interpolate continuous values only; u in [0,1]
   for (const k of CFG_KEYS) cfg[k] = A.c[k] + (B.c[k] - A.c[k]) * u;
+  if (typeof auto.seed === 'number') cfg.rule_seed = auto.seed;   // seed stays fixed so mutation noise never re-rolls mid-transition
   cfg.cohorts = Math.round(cfg.cohorts);
   const r = new Array(80);
   for (let i = 0; i < 80; i++) r[i] = A.c.rule[i] + (B.c.rule[i] - A.c.rule[i]) * u;
@@ -1115,9 +1119,12 @@ function setAuto(on){
   $('bAuto').classList.toggle('on', on);
   if (on){
     auto.bag = []; auto.last = -1;
+    auto.seed = cfg.rule_seed;                       // keep the organism seed: every config morphs from the same base
     auto.cur = bagNext();
-    applyConfig(auto.configs[auto.cur]);
-    auto.mode = 'dwell'; auto.t = 0;
+    auto.next = auto.cur;
+    auto.from = normalizeConfig(serializeState());   // crossfade in from whatever is on screen (no snap)
+    auto.to = auto.configs[auto.cur];
+    auto.mode = 'fade'; auto.t = 0;
   }
 }
 function autoStep(dtms){
