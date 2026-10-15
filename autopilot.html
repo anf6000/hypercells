@@ -95,8 +95,7 @@ Differences from simple.html (see plan hypercells-autopilot-standalone):
 
   <div class="sec"><h4>Organism &amp; world</h4>
     <div class="row"><label>cohorts</label><input type="range" id="sCohorts" min="1" max="24" step="1"><output id="oCohorts"></output></div>
-    <div class="row"><label>world size</label><select id="selQuality" style="grid-column:2/4">
-      <option value="0.08">tiny</option><option value="0.25">small</option><option value="0.5">medium</option><option value="1">large</option></select></div>
+    <div class="row"><label>world size</label><select id="selQuality" style="grid-column:2/4"></select></div>
   </div>
 
   <div class="sec"><h4>Render</h4><div id="secRender"></div></div>
@@ -250,7 +249,8 @@ vec4 do_reset(int index, int mode){
     float gcy = floor(float(int(cohort_val)) / spot_rows);
     pos += vec2(1.0 / tex_scale.x, 1.0 / tex_scale.y) * 1.8 * (vec2(gcx, gcy) / spot_rows + 0.5 * (1.0 / spot_rows - 1.0));
   } else if (mode == 1){
-    pos = vec2(hash(vec2(cohort_val, u_reset_seed + 1.0)), hash(vec2(cohort_val, u_reset_seed + 2.0))) * 2.0 - 1.0;
+    // span the whole field, which is wider than the -1..1 square when FILL_SCREEN
+    pos = (vec2(hash(vec2(cohort_val, u_reset_seed + 1.0)), hash(vec2(cohort_val, u_reset_seed + 2.0))) * 2.0 - 1.0) * (1.0 / tex_scale);
   } else {
     float angle = cohort_val / cohorts * 2.0 * PI;
     float radius = 0.5 * min(1.0 / tex_scale.x, 1.0 / tex_scale.y);
@@ -310,7 +310,10 @@ void main(){
   if (sp > u_max_speed) vel *= u_max_speed / sp;   // stability guard: no unbounded terminal speed
   pos += vel;
   pos += strafe * config_c.x;
-  pos = 2.0 * (fract(pos / 2.0 - 0.5) - 0.5);
+  // wrap per axis: the sim space is [-1/tex_scale] on each axis (a square for the square field,
+  // wider for a full-screen one), so the wrap has to follow tex_scale rather than assume 2.0
+  vec2 half_field = 1.0 / tex_scale;
+  pos = half_field * (2.0 * (fract(pos / (2.0 * half_field) - 0.5) - 0.5));
   fragColor = vec4(pos, vel);
 }`;
 
@@ -339,6 +342,7 @@ in vec2 v_uv;
 in vec4 v_pos_vel;
 layout(location = 0) out vec4 brush_out;
 uniform int frame_count;
+uniform float u_brush_weight;   // deposit scale: <1 when the count is above BRUSH_REF_PARTICLES
 float gaussian(vec2 pos, float sigma){
   float sigma2 = sigma * sigma;
   float norm = 1.0 / (2.0 * 3.14159265359 * sigma2);
@@ -349,7 +353,7 @@ void main(){
   float kernel_func = gaussian(v_uv - 0.5, 0.163);
   if (length(v_uv - 0.5) > 0.5 || frame_count == 0) discard;
   vec2 vel = v_pos_vel.zw;
-  brush_out = vec4(vel, 0.01, 1.0) * kernel_func;
+  brush_out = vec4(vel, 0.01, 1.0) * kernel_func * u_brush_weight;
 }`;
 
 const CANVAS_FS = `#version 300 es
@@ -419,13 +423,15 @@ void main(){
 }`;
 
 const SPRITE_VS = `#version 300 es
-#define SPRITE_SIZE 1.5
 uniform sampler2D entity_texture;
 uniform int entity_tex_width;
 uniform int entity_count;
 uniform int cohorts;
 uniform float sqrt_world_size;
 uniform vec2 tex_scale;
+uniform vec2 u_field_px;     // field size in texels: sprite size is measured in texels, not texas
+uniform float u_sprite_half; // sprite half extent, in field texels
+uniform float u_snap;        // 1: snap the sprite centre to the texel grid (single-pixel sprites)
 uniform float u_hue_time;    // deterministic sim clock in seconds (counts sim steps)
 uniform float u_hue_drift;   // cycles/second: how fast each colour group travels the palette
 uniform float u_hue_wobble;  // bounded per-particle hue wobble amplitude
@@ -441,7 +447,6 @@ void main(){
   ivec2 tc = ivec2(gl_InstanceID % entity_tex_width, gl_InstanceID / entity_tex_width);
   vec4 entity = texelFetch(entity_texture, tc, 0);
   vec2 entity_pos = entity.xy;
-  float size = SPRITE_SIZE * 0.0015 / sqrt_world_size;
   int cohort_index = int(floor(float(gl_InstanceID) * float(cohorts) / float(entity_count)));
   // All particles share ONE drift rate, so their hues keep their relative spacing for ever and
   // the palette can never come apart. A per-cohort (or per-particle) RATE difference is the one
@@ -455,11 +460,22 @@ void main(){
   float wobble = u_hue_wobble * sin(6.2831853 * (0.0125 * u_hue_time + group_phase));
   float hue = hash_float(uint(cohort_index) * 2654435761u) + u_hue_drift * u_hue_time + wobble;
   v_color = vec4(hue, 0.8, 1.0, 1.0);
-  vec2 offsets[4] = vec2[4](vec2(-size, -size), vec2(size, -size), vec2(size, size), vec2(-size, size));
   vec2 uv_coords[4] = vec2[4](vec2(0.0, 0.0), vec2(1.0, 0.0), vec2(1.0, 1.0), vec2(0.0, 1.0));
-  bool visible = abs(entity_pos.x) <= 1.0 / tex_scale.x && abs(entity_pos.y) <= 1.0 / tex_scale.y;
-  vec2 vp = entity_pos + (visible ? offsets[gl_VertexID] : vec2(0.0));
-  gl_Position = vec4(vp * tex_scale, 0.0, 1.0);
+  vec2 corners[4] = vec2[4](vec2(-1.0, -1.0), vec2(1.0, -1.0), vec2(1.0, 1.0), vec2(-1.0, 1.0));
+  // Sprite size is set in FIELD TEXELS, not in sim units, so zooming the field (world size) or
+  // running at a different resolution cannot change how big a particle is on screen. u_snap pins
+  // the centre to a texel centre, which is what makes a 1-texel sprite land on exactly one pixel
+  // instead of landing on a texel boundary and vanishing half the time.
+  vec2 centre = entity_pos * tex_scale;
+  if (u_snap > 0.5){
+    vec2 texel = (centre * 0.5 + 0.5) * u_field_px;
+    centre = (floor(texel) + 0.5) / u_field_px * 2.0 - 1.0;
+  }
+  vec2 half_field = 1.0 / tex_scale;
+  bool visible = abs(entity_pos.x) <= half_field.x && abs(entity_pos.y) <= half_field.y;
+  vec2 half_clip = u_sprite_half * 2.0 / u_field_px;
+  vec2 vp = centre + (visible ? corners[gl_VertexID] * half_clip : vec2(0.0));
+  gl_Position = vec4(vp, 0.0, 1.0);
   v_uv = uv_coords[gl_VertexID];
 }`;
 
@@ -513,14 +529,17 @@ void main(){
 const PRESENT_FS = `#version 300 es
 precision highp float;
 uniform sampler2D tex;
-uniform ivec2 offset;   // integer window->sim offset (avoids half-pixel column/row duplication)
-uniform int scale;      // integer upscale (no uneven nearest-neighbour columns)
+uniform vec2 offset;    // window px offset of the field rect
+uniform vec2 scale;     // window px per field texel
+uniform int nearest;    // 1 = integer upscale, sample texel centres so pixels stay crisp
+                        // 0 = the field is bigger than the window: fit it and filter
 out vec4 o;
 void main(){
-  ivec2 sp = ivec2(gl_FragCoord.xy) - offset;
-  ivec2 sz = textureSize(tex, 0) * scale;
-  if (any(lessThan(sp, ivec2(0))) || any(greaterThanEqual(sp, sz))){ o = vec4(0.0, 0.0, 0.0, 1.0); return; }
-  o = vec4(texelFetch(tex, sp / scale, 0).rgb, 1.0);
+  vec2 p = (gl_FragCoord.xy - offset) / scale;
+  vec2 sz = vec2(textureSize(tex, 0));
+  if (any(lessThan(p, vec2(0.0))) || any(greaterThanEqual(p, sz))){ o = vec4(0.0, 0.0, 0.0, 1.0); return; }
+  vec2 uv = (nearest > 0 ? (floor(p) + 0.5) : p) / sz;
+  o = vec4(texture(tex, uv).rgb, 1.0);
 }`;
 
 // Health monitor reduction: 32x32 box average of the sensed field.
@@ -620,6 +639,25 @@ const FORCE_ZERO_MAX_SEC = 1.0;  // auto mode: force may not sit at zero longer 
 const FORCE_TARGET_MIN = 0.05;   // targets keep this much force, and a crossing holds it too
 const FORCE_MAX = 0.5;           // hard ceiling on |force|: force stays inside +-0.5 (was -1.2/+1.6
                                  // in the clamp and -1/+2 on the slider before)
+const HAZARD_MAX = 0.05;         // hazard slider ceiling, matching simple.html / index.html
+const CANVAS_DIM = 1024;         // sim field edge in texels at world size 1 (2160 in autopilot-4k.html)
+const PARTICLE_BASE = 600000;    // particles at world size 1 (1000000 in autopilot-4k.html)
+const FILL_SCREEN = false;       // false: square field, letterboxed. true: the field takes the window's
+                                 // aspect and fills the screen, and the sim space widens with it
+                                 // (a 16:9 field drawn from a square sim space would stretch patterns)
+const SCALE_FIELD_WITH_WORLD = true;  // true: world size scales the field resolution, and the tuned
+                                      // distances with it. false: it scales only the particle count
+const PARTICLE_PX = 0;           // 0: soft sprite, sized as SPRITE_FIELD_FRACTION of the field height.
+                                 // >0: hard sprite of exactly this many field texels, snapped to the
+                                 // texel grid, so 1 is a single pixel that never flickers
+const SPRITE_DIM_FRACTION = 0.001125;  // soft sprite diameter as a fraction of CANVAS_DIM, which is
+                                       // what makes it 1.152 texels at any world size (the original)
+const NORMALISE_DEPOSIT = false; // true: scale the deposit so the field strength does not depend on
+                                 // the particle count, keeping the look the configs were tuned at
+const BRUSH_REF_PARTICLES = 600000;      // the count at which the deposit weight is 1
+// world size scales the particle count, and the field resolution too unless
+// SCALE_FIELD_WITH_WORLD is off (a fixed-resolution build turns it into a density control)
+const WORLD_SIZES = [[0.08, 'tiny'], [0.25, 'small'], [0.5, 'medium'], [1, 'large']];
 
 const PHYS_KEYS = ['sensor_gain', 'sensor_angle', 'sensor_distance', 'global_force_mult', 'drag',
                    'strafe_power', 'axial_force', 'lateral_force', 'mutation_scale', 'hazard_rate',
@@ -636,7 +674,7 @@ const ENC = {
   axial_force:       { enc: v => Math.sign(v) * Math.sqrt(Math.abs(v)),        dec: v => Math.sign(v) * Math.min(v * v, 1.2) },
   lateral_force:     { enc: v => Math.sign(v) * Math.sqrt(Math.abs(v)),        dec: v => Math.sign(v) * Math.min(v * v, 2.2) },
   mutation_scale:    { enc: v => Math.sqrt(Math.max(v, 0)),                    dec: v => clamp(v * v, 0, 1.2) },
-  hazard_rate:       { enc: v => v,                                            dec: v => clamp(v, 0, 0.02) },
+  hazard_rate:       { enc: v => v,                                            dec: v => clamp(v, 0, HAZARD_MAX) },
   trail_persistence: { enc: v => { const q = clamp((v - 0.9) / (0.999 - 0.9), 0.001, 0.999); return Math.log(q / (1 - q)); },
                        dec: v => 0.9 + 0.099 * (1 / (1 + Math.exp(-clamp(v, -8, 8)))) },
   trail_diffusion:   { enc: v => v,                                            dec: v => clamp(v, 0, 1) },
@@ -680,13 +718,24 @@ function computeConstants(){
   const W = Math.max(2, Math.round(window.innerWidth));
   const H = Math.max(2, Math.round(window.innerHeight));
   const worldSize = app.simWorldSize;
-  const sqrtWorldSize = Math.sqrt(worldSize);
-  const entityCount = Math.floor(600000 * worldSize);
-  // Fluoddity-Core: CANVAS_DIM = 1024 * sqrt(world size); all distances are tuned against it.
-  const canvasWidth = Math.round(1024 * sqrtWorldSize), canvasHeight = canvasWidth;
+  const entityCount = Math.floor(PARTICLE_BASE * worldSize);
+  // Fluoddity-Core tunes every distance against the field size, so when the field scales with
+  // world size the distances must scale too -- and when it does not (a fixed-resolution build)
+  // they must not, or the look would drift with the particle-count control.
+  const fieldScale = SCALE_FIELD_WITH_WORLD ? Math.sqrt(worldSize) : 1;
+  const sqrtWorldSize = fieldScale;
+  const canvasHeight = Math.max(2, Math.round(CANVAS_DIM * fieldScale));
+  const aspect = FILL_SCREEN ? W / H : 1;
+  const canvasWidth = Math.max(2, Math.round(canvasHeight * aspect));
+  // The sim space is [-aspect, aspect] x [-1, 1] and tex_scale maps it to clip space, so one sim
+  // unit is the same number of texels on both axes. Square texels are what keeps round deposits
+  // round: with tex_scale [1,1] and a 16:9 field everything would be stretched 16:9.
+  const texScale = [1 / aspect, 1];
   const entityTexWidth = Math.ceil(Math.sqrt(entityCount));
   const entityTexHeight = Math.ceil(entityCount / entityTexWidth);
-  return { W, H, tex_scale: [1, 1], worldSize, sqrtWorldSize, entityCount, canvasWidth, canvasHeight, entityTexWidth, entityTexHeight };
+  const brushWeight = NORMALISE_DEPOSIT ? Math.min(1, BRUSH_REF_PARTICLES / Math.max(entityCount, 1)) : 1;
+  return { W, H, tex_scale: texScale, worldSize, sqrtWorldSize, entityCount, canvasWidth, canvasHeight,
+           entityTexWidth, entityTexHeight, brushWeight };
 }
 function floatTex(w, h, linear){
   const t = gl.createTexture();
@@ -793,7 +842,7 @@ function clampPhysics(p){
   p.axial_force = clamp(p.axial_force, -1.2, 1.2);
   p.lateral_force = clamp(p.lateral_force, -2.2, 1.2);
   p.mutation_scale = clamp(p.mutation_scale, 0, 1.2);
-  p.hazard_rate = clamp(p.hazard_rate, 0, 0.02);
+  p.hazard_rate = clamp(p.hazard_rate, 0, HAZARD_MAX);
   p.trail_persistence = clamp(p.trail_persistence, PERS_MIN, PERS_MAX);
   p.trail_diffusion = clamp(p.trail_diffusion, 0, 1);
   return p;
@@ -828,6 +877,7 @@ function createBrush(){
   u1f(p, 'sqrt_world_size', C.sqrtWorldSize);
   u2f(p, 'tex_scale', C.tex_scale);
   u1i(p, 'frame_count', frameCount);
+  u1f(p, 'u_brush_weight', C.brushWeight);
   gl.bindVertexArray(brushVAO);
   gl.drawArraysInstanced(gl.TRIANGLE_FAN, 0, 4, C.entityCount);
   gl.disable(gl.BLEND);
@@ -881,6 +931,13 @@ function advance(){
   paintPing  = updateLayer(paintTex,  paintFBO,  paintPing,  cfg.paint_persistence, cfg.paint_gain);
   frameCount++;
 }
+// Sprite half extent in FIELD TEXELS. PARTICLE_PX pins it (1 = a particle is one texel across,
+// and the shader snaps it to the texel grid); otherwise it is the original soft sprite: a fixed
+// fraction of CANVAS_DIM, i.e. 1.152 texels at any world size. Sizing it against the field
+// *height* instead would shrink it to nothing at small world sizes.
+function spriteHalfTexels(){
+  return PARTICLE_PX > 0 ? PARTICLE_PX * 0.5 : 0.5 * SPRITE_DIM_FRACTION * CANVAS_DIM;
+}
 function spritePass(target){
   const p = progSprite;
   gl.useProgram(p);
@@ -895,6 +952,9 @@ function spritePass(target){
   u2f(p, 'tex_scale', C.tex_scale);
   u1f(p, 'brightness', app.brightness);
   u1f(p, 'u_hard', app.hardPixels ? 1 : 0);
+  u2f(p, 'u_field_px', [C.canvasWidth, C.canvasHeight]);
+  u1f(p, 'u_sprite_half', spriteHalfTexels(C));
+  u1f(p, 'u_snap', PARTICLE_PX > 0 ? 1 : 0);
   u1f(p, 'u_hue_time', simStep * SEC_PER_STEP);
   u1f(p, 'u_hue_drift', app.hueDrift);
   u1f(p, 'u_hue_wobble', app.hueWobble);
@@ -905,17 +965,22 @@ function spritePass(target){
   gl.disable(gl.BLEND);
 }
 function viewportMap(){
-  const W = gl.drawingBufferWidth, H = gl.drawingBufferHeight, N = C.canvasWidth;
-  const k = Math.max(1, Math.floor(Math.min(W, H) / N));
-  return { k, ox: Math.floor((W - N * k) / 2), oy: Math.floor((H - N * k) / 2), W, H, N };
+  const W = gl.drawingBufferWidth, H = gl.drawingBufferHeight;
+  const nx = C.canvasWidth, ny = C.canvasHeight;
+  let scale = Math.min(W / nx, H / ny);
+  let nearest = 0;
+  if (scale >= 1){ scale = Math.floor(scale); nearest = 1; }   // integer upscale: crisp texels
+  const ox = Math.floor((W - nx * scale) / 2), oy = Math.floor((H - ny * scale) / 2);
+  return { scale, nearest, ox, oy };
 }
 function presentPass(tex){
   const p = progPresent;
   gl.useProgram(p);
   bindTex(0, tex, p, 'tex');
   const v = viewportMap();
-  gl.uniform2i(loc(p, 'offset'), v.ox, v.oy);
-  gl.uniform1i(loc(p, 'scale'), v.k);
+  gl.uniform2f(loc(p, 'offset'), v.ox, v.oy);
+  gl.uniform2f(loc(p, 'scale'), v.scale, v.scale);
+  gl.uniform1i(loc(p, 'nearest'), v.nearest);
   gl.bindFramebuffer(gl.FRAMEBUFFER, null);
   gl.viewport(0, 0, gl.drawingBufferWidth, gl.drawingBufferHeight);
   gl.bindVertexArray(quadVAO);
@@ -1387,6 +1452,13 @@ function syncUI(){
   }
 }
 function buildUI(){
+  const sel = $('selQuality');
+  sel.textContent = '';
+  for (const [v, label] of WORLD_SIZES){
+    const o = document.createElement('option');
+    o.value = String(v); o.textContent = label;
+    sel.appendChild(o);
+  }
   const secPhys = $('secPhysics'), secRender = $('secRender');
   const dragMin = app.allowNegativeDrag ? DRAG_MIN_NEG : 0;
   addSlider(secPhys, 'sensor_angle', 'sensor angle', -1, 1, 0.001, v => (v * 180).toFixed(1) + '\u00b0');
@@ -1395,6 +1467,7 @@ function buildUI(){
   addSlider(secPhys, 'global_force_mult', 'force', -FORCE_MAX, FORCE_MAX, 0.01, v => v.toFixed(2));
   addSlider(secPhys, 'drag', 'drag', dragMin, 1, 0.001, v => v.toFixed(3));
   addSlider(secPhys, 'mutation_scale', 'mutation', 0, 1, 0.005, v => v.toFixed(3));
+  addSlider(secPhys, 'hazard_rate', 'hazard', 0, HAZARD_MAX, 0.0005, v => v.toFixed(4));
   addSlider(secPhys, 'trail_persistence', 'persistence', PERS_MIN, PERS_MAX, 0.001, v => v.toFixed(3));
   addSlider(secRender, '__brightness', 'brightness', 0.2, 3, 0.01, v => v.toFixed(2));
   addSlider(secRender, '__accum', 'accumulation', 0, 1, 0.01, v => v.toFixed(2));
