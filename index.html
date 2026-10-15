@@ -13,10 +13,10 @@ physics step: move (GPGPU entity ping-pong) -> deposit (instanced gaussian sprit
 diffuse (canvas update) -> paint (permanent no-fade copy of the deposits). Display adds an
 optional accumulation buffer (long exposure) in front of the asinh tonemap. Two particle
 blend modes: additive (accumulate + tonemap) or solid paint (source-over, opaque colors,
-exposure/tonemap bypassed, bounded-memory fade on the paint). Each particle gets a small
-deterministic hue offset, and the whole palette drifts slowly over time, so a mass of
-particles ages from one colour into the next while already-deposited colour stays put. Field
-view hue-maps the paint/flow layer.
+exposure/tonemap bypassed, bounded-memory fade on the paint). Colours are mapped from each
+particle's heading, so the swarm reads as coherent directional colour bands rather than
+per-organism speckle, and the whole palette drifts slowly over time. Field view hue-maps the
+paint/flow layer.
 -->
 <style>
   :root { --accent:#7ee7ff; --panel:rgba(13,16,20,.78); --line:rgba(255,255,255,.09); }
@@ -404,11 +404,9 @@ void main(){
   vec4 entity = texelFetch(entity_texture, tc, 0);
   vec2 entity_pos = entity.xy;
   float size = SPRITE_SIZE * 0.0015 / sqrt_world_size;
-  int cohort_index = int(floor(float(gl_InstanceID) * float(cohorts) / float(entity_count)));
-  float hue = hash_float(uint(cohort_index) * 2654435761u);
-  hue += (hash_float(uint(gl_InstanceID) * 2246822519u) - 0.5) * 0.06;        // +-3% per-particle colour noise
-  float drift = 0.01;                                                          // slow global hue drift (hue/sec)
-  hue = fract(hue + u_time * drift);                                         // whole palette drifts together -> filaments stay coherent
+  vec2 entity_vel = entity.zw;
+  float hue = atan(entity_vel.y, entity_vel.x) * 0.15915494309 + 0.5;         // colour by heading: particles moving together share a hue
+  hue = fract(hue + u_time * 0.01);                                          // slow global drift so the palette still ages
   v_color = vec4(hue, 0.8, 1.0, mix(0.045, 1.0, u_solid));
   vec2 offsets[4] = vec2[4](vec2(-size, -size), vec2(size, -size), vec2(size, size), vec2(-size, size));
   vec2 uv_coords[4] = vec2[4](vec2(0.0, 0.0), vec2(1.0, 0.0), vec2(1.0, 1.0), vec2(0.0, 1.0));
