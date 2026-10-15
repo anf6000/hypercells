@@ -14,10 +14,11 @@ diffuse (canvas update) -> paint (permanent no-fade copy of the deposits). Displ
 optional accumulation buffer (long exposure) in front of the asinh tonemap. Two particle
 blend modes: additive (accumulate + tonemap) or solid paint (source-over, opaque colors,
 exposure/tonemap bypassed, bounded-memory fade on the paint). Particle colour comes from a
-texture, chosen by the 'c' colour mode: 'paint' samples the image at each particle's position,
-'palette' lets the heading sample a palette strip derived from the image, and 'hue' uses an
-artificial hue palette. Textures cycle (crossfaded) with the configs in auto-mode. Field view
-hue-maps the paint/flow layer.
+texture, chosen by the 'c' colour mode: 'paint' gives every particle a fixed texture
+coordinate at spawn (so it carries its own colour as it moves), 'palette' lets the heading
+sample a palette strip derived from the image, and 'hue' uses an artificial hue palette.
+Textures cycle (crossfaded) with the configs in auto-mode. Field view hue-maps the paint/flow
+layer.
 -->
 <style>
   :root { --accent:#7ee7ff; --panel:rgba(13,16,20,.78); --line:rgba(255,255,255,.09); }
@@ -393,7 +394,8 @@ uniform int cohorts;
 uniform float sqrt_world_size;
 uniform vec2 tex_scale;
 uniform float u_solid;
-uniform int u_color_mode;   // 0 = paint the image by position, 1 = heading samples the colour strip (image palette or the artificial palette)
+uniform int u_color_mode;   // 0 = per-particle texture coord, 1 = heading samples the colour strip (image palette or the artificial palette)
+uniform sampler2D entity_uv_texture;
 out vec2 v_uv;
 out vec4 v_color;
 void main(){
@@ -403,8 +405,8 @@ void main(){
   float size = SPRITE_SIZE * 0.0015 / sqrt_world_size;
   vec2 entity_vel = entity.zw;
   float heading = atan(entity_vel.y, entity_vel.x) * 0.15915494309 + 0.5;     // heading -> [0,1)
-  vec2 uvc = (u_color_mode == 1) ? vec2(heading, 0.5)                         // palette: heading picks a colour from the strip
-                                 : vec2(entity_pos.x * 0.5 + 0.5, 0.5 - entity_pos.y * 0.5);  // paint: sample the image at the particle's position
+  vec2 uvc = (u_color_mode == 1) ? vec2(heading, 0.5)                          // palette: heading picks a colour from the strip
+                                 : texelFetch(entity_uv_texture, tc, 0).xy;    // paint: the coordinate assigned to this particle at spawn
   v_color = vec4(uvc, 0.0, mix(0.045, 1.0, u_solid));
   vec2 offsets[4] = vec2[4](vec2(-size, -size), vec2(size, -size), vec2(size, size), vec2(-size, size));
   vec2 uv_coords[4] = vec2[4](vec2(0.0, 0.0), vec2(1.0, 0.0), vec2(1.0, 1.0), vec2(0.0, 1.0));
@@ -438,6 +440,15 @@ void main(){
   vec3 base = mix(texture(u_color_tex, v_color.xy).rgb, texture(u_color_tex2, v_color.xy).rgb, u_tex_mix);
   vec3 rgb = base * brightness * mix(3.0, 1.0, u_solid);
   fragColor = vec4(rgb, min(v_color.w * kernel, 1.0));
+}`;
+
+const UVASSIGN_FS = `#version 300 es
+precision highp float;
+uniform sampler2D entity_texture;
+out vec4 fragColor;
+void main(){                                    // store each particle's spawn-position as its fixed texture coordinate
+  vec4 e = texelFetch(entity_texture, ivec2(gl_FragCoord.xy), 0);
+  fragColor = vec4(e.x * 0.5 + 0.5, 0.5 - e.y * 0.5, 0.0, 1.0);
 }`;
 
 const COMP_FS = `#version 300 es
@@ -544,11 +555,12 @@ const CFG_KEYS = ['cohorts','rule_seed','sensor_gain','sensor_angle','sensor_dis
 
 let C = null;
 const entityTex = [null,null], entityFBO = [null,null];
+let entityUvTex = null, entityUvFBO = null, uvDirty = true;   // per-particle texture coordinate (assigned at spawn)
 const canvasTex = [null,null], canvasFBO = [null,null];
 const paintTex = [null,null], paintFBO = [null,null];
 let brushTex = null, brushFBO = null;
 let entityPing = 0, canvasPing = 0, paintPing = 0, frameCount = 0, ruleDirty = true;
-let progEntity, progBrush, progCanvas, progField, progSprite, progTonemap, progComp, progPresent;
+let progEntity, progBrush, progCanvas, progField, progSprite, progTonemap, progComp, progPresent, progUvAssign;
 let quadVAO, brushVAO;
 let sceneBufTex = null, sceneBufFBO = null;
 let viewTex = null, viewFBO = null;
@@ -625,6 +637,7 @@ function initGL(){
   progTonemap = makeProgram(QUAD_VS, TONEMAP_FS);
   progComp    = makeProgram(QUAD_VS, COMP_FS);
   progPresent = makeProgram(QUAD_VS, PRESENT_FS);
+  progUvAssign = makeProgram(QUAD_VS, UVASSIGN_FS);
   quadVAO  = makeQuadVAO();
   brushVAO = makeBrushVAO();
 }
@@ -635,6 +648,7 @@ function destroyResources(){
     if (paintTex[i]){ gl.deleteTexture(paintTex[i]); gl.deleteFramebuffer(paintFBO[i]); }
   }
   if (brushTex){ gl.deleteTexture(brushTex); gl.deleteFramebuffer(brushFBO); }
+  if (entityUvTex){ gl.deleteTexture(entityUvTex); gl.deleteFramebuffer(entityUvFBO); entityUvTex = null; entityUvFBO = null; }
   if (sceneBufTex){ gl.deleteTexture(sceneBufTex); gl.deleteFramebuffer(sceneBufFBO); sceneBufTex = null; sceneBufFBO = null; }
   if (viewTex){ gl.deleteTexture(viewTex); gl.deleteFramebuffer(viewFBO); viewTex = null; viewFBO = null; }
   for (let i = 0; i < 2; i++){
@@ -646,6 +660,7 @@ function createResources(){
   destroyResources();
   C = computeConstants();
   for (let i = 0; i < 2; i++){ entityTex[i] = floatTex(C.entityTexWidth, C.entityTexHeight, false); entityFBO[i] = fboOf(entityTex[i]); }
+  entityUvTex = floatTex(C.entityTexWidth, C.entityTexHeight, false); entityUvFBO = fboOf(entityUvTex);
   for (let i = 0; i < 2; i++){ canvasTex[i] = floatTex(C.canvasWidth, C.canvasHeight, true); canvasFBO[i] = fboOf(canvasTex[i]); }
   for (let i = 0; i < 2; i++){ paintTex[i] = floatTex(C.canvasWidth, C.canvasHeight, true); paintFBO[i] = fboOf(paintTex[i]); }
   paintPing = 0;
@@ -654,7 +669,7 @@ function createResources(){
   sceneBufTex = screenTex(C.canvasWidth, C.canvasHeight); sceneBufFBO = fboOf(sceneBufTex);
   viewTex = screenTex(C.canvasWidth, C.canvasHeight); viewFBO = fboOf(viewTex);
   for (let i = 0; i < 2; i++){ accumTex[i] = screenTex(C.canvasWidth, C.canvasHeight); accumFBO[i] = fboOf(accumTex[i]); }
-  entityPing = 0; canvasPing = 0; frameCount = 0; ruleDirty = true; accumPing = 0;
+  entityPing = 0; canvasPing = 0; frameCount = 0; ruleDirty = true; accumPing = 0; uvDirty = true;
 }
 
 // ---- colour textures ---------------------------------------------------------
@@ -797,9 +812,20 @@ function updateLayer(tex, fbo, ping, persistence, gain){
   gl.drawArrays(gl.TRIANGLES, 0, 6);
   return w;
 }
+function assignUv(){                               // give every particle a fixed texture coordinate taken at its spawn position
+  const p = progUvAssign;
+  gl.useProgram(p);
+  gl.bindFramebuffer(gl.FRAMEBUFFER, entityUvFBO);
+  gl.viewport(0, 0, C.entityTexWidth, C.entityTexHeight);
+  bindTex(0, entityTex[entityPing], p, 'entity_texture');
+  gl.bindVertexArray(quadVAO);
+  gl.drawArrays(gl.TRIANGLES, 0, 6);
+  gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+}
 function advance(){
   createBrush();
   updateEntities();
+  if (uvDirty){ assignUv(); uvDirty = false; }
   const p = progCanvas;
   gl.useProgram(p);
   gl.viewport(0, 0, C.canvasWidth, C.canvasHeight);
@@ -830,6 +856,7 @@ function spritePass(target){
   u1f(p, 'u_tex_mix', texLib.mix);
   bindTex(1, colorTexFor(texLib.prev), p, 'u_color_tex');
   bindTex(2, colorTexFor(texLib.cur), p, 'u_color_tex2');
+  bindTex(3, entityUvTex, p, 'entity_uv_texture');
   gl.enable(gl.BLEND);
   // solid: premultiplied rgb + true coverage alpha (alpha was previously squared, then re-multiplied in COMP)
   if (solid) gl.blendFuncSeparate(gl.SRC_ALPHA, gl.ONE_MINUS_SRC_ALPHA, gl.ONE, gl.ONE_MINUS_SRC_ALPHA);
@@ -884,6 +911,7 @@ function resetSim(seed){
   }
   gl.bindFramebuffer(gl.FRAMEBUFFER, null);
   paintPing = 0;
+  uvDirty = true;
 }
 function render(){
   const solid = app.view === 'particles' && app.blend === 'solid';
