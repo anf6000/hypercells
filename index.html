@@ -13,10 +13,10 @@ physics step: move (GPGPU entity ping-pong) -> deposit (instanced gaussian sprit
 diffuse (canvas update) -> paint (permanent no-fade copy of the deposits). Display adds an
 optional accumulation buffer (long exposure) in front of the asinh tonemap. Two particle
 blend modes: additive (accumulate + tonemap) or solid paint (source-over, opaque colors,
-exposure/tonemap bypassed, bounded-memory fade on the paint). Colours are mapped from each
-particle's heading, so the swarm reads as coherent directional colour bands rather than
-per-organism speckle, and the whole palette drifts slowly over time. Field view hue-maps the
-paint/flow layer.
+exposure/tonemap bypassed, bounded-memory fade on the paint). Each particle picks its colour
+from the original 12-colour palette according to its heading, so the swarm keeps the familiar
+palette while the colours distribute coherently by flow direction, and the whole palette
+drifts slowly over time. Field view hue-maps the paint/flow layer.
 -->
 <style>
   :root { --accent:#7ee7ff; --panel:rgba(13,16,20,.78); --line:rgba(255,255,255,.09); }
@@ -399,13 +399,16 @@ uint pcg_hash(uint seed){
   return (word >> 22u) ^ word;
 }
 float hash_float(uint x){ return float(pcg_hash(x)) / float(0xffffffffu); }
+// The original 12-colour palette (hues the swarm was coloured with before heading mapping) - weighted toward blues/violets/magentas.
+const float PALETTE[12] = float[12](0.03, 0.18, 0.18, 0.23, 0.44, 0.56, 0.63, 0.63, 0.73, 0.79, 0.85, 0.90);
 void main(){
   ivec2 tc = ivec2(gl_InstanceID % entity_tex_width, gl_InstanceID / entity_tex_width);
   vec4 entity = texelFetch(entity_texture, tc, 0);
   vec2 entity_pos = entity.xy;
   float size = SPRITE_SIZE * 0.0015 / sqrt_world_size;
   vec2 entity_vel = entity.zw;
-  float hue = atan(entity_vel.y, entity_vel.x) * 0.15915494309 + 0.5;         // colour by heading: particles moving together share a hue
+  float heading = atan(entity_vel.y, entity_vel.x) * 0.15915494309 + 0.5;     // heading -> [0,1)
+  float hue = PALETTE[int(clamp(floor(heading * 12.0), 0.0, 11.0))];          // heading picks a colour from the original palette
   hue = fract(hue + u_time * 0.01);                                          // slow global drift so the palette still ages
   v_color = vec4(hue, 0.8, 1.0, mix(0.045, 1.0, u_solid));
   vec2 offsets[4] = vec2[4](vec2(-size, -size), vec2(size, -size), vec2(size, size), vec2(-size, size));
