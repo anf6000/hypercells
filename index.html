@@ -13,10 +13,11 @@ physics step: move (GPGPU entity ping-pong) -> deposit (instanced gaussian sprit
 diffuse (canvas update) -> paint (permanent no-fade copy of the deposits). Display adds an
 optional accumulation buffer (long exposure) in front of the asinh tonemap. Two particle
 blend modes: additive (accumulate + tonemap) or solid paint (source-over, opaque colors,
-exposure/tonemap bypassed, bounded-memory fade on the paint). Each particle picks its colour
-from the original 12-colour palette according to its heading, so the swarm keeps the familiar
-palette while the colours distribute coherently by flow direction, and the whole palette
-drifts slowly over time. Field view hue-maps the paint/flow layer.
+exposure/tonemap bypassed, bounded-memory fade on the paint). Particle colour comes from a
+texture, chosen by the 'c' colour mode: 'paint' samples the image at each particle's position,
+'palette' lets the heading sample a palette strip derived from the image, and 'hue' uses an
+artificial hue palette. Textures cycle (crossfaded) with the configs in auto-mode. Field view
+hue-maps the paint/flow layer.
 -->
 <style>
   :root { --accent:#7ee7ff; --panel:rgba(13,16,20,.78); --line:rgba(255,255,255,.09); }
@@ -57,6 +58,7 @@ drifts slowly over time. Field view hue-maps the paint/flow layer.
     <button id="bPause">pause</button><button id="bReset">reset</button><button id="bNew">new</button>
     <button id="bMutate">mutate</button><button id="bView">view: particles</button>
     <button id="bHard">hard px</button><button id="bBlend">blend: solid</button><button id="bAuto">auto: off</button>
+    <button id="bColor">color: palette</button><button id="bTex">next texture</button>
   </div>
   <div class="sec"><h4>Organism</h4>
     <div class="row"><label>presets</label><select id="selPreset" style="grid-column:2/4"></select></div>
@@ -73,7 +75,7 @@ drifts slowly over time. Field view hue-maps the paint/flow layer.
     <button id="bSave">save json</button><button id="bLoad" style="grid-column:2/4">load json</button>
   </div>
   <input type="file" id="fileLoad" accept="application/json,.json" style="display:none">
-  <div class="hint"><b>space</b> pause &nbsp;· <b>r</b> reset &nbsp;· <b>n</b> new organism &nbsp;· <b>m</b> mutate &nbsp;· <b>f</b> field view &nbsp;· <b>p</b> hard pixels &nbsp;· <b>b</b> blend mode &nbsp;· <b>a</b> auto &nbsp;· <b>h</b> hide panel.</div>
+  <div class="hint"><b>space</b> pause &nbsp;· <b>r</b> reset &nbsp;· <b>n</b> new organism &nbsp;· <b>m</b> mutate &nbsp;· <b>f</b> field view &nbsp;· <b>p</b> hard pixels &nbsp;· <b>b</b> blend mode &nbsp;· <b>c</b> color mode &nbsp;· <b>t</b> next texture &nbsp;· <b>a</b> auto &nbsp;· <b>h</b> hide panel.</div>
 </div>
 <div id="hud"></div>
 <div id="err"></div>
@@ -83,6 +85,7 @@ drifts slowly over time. Field view hue-maps the paint/flow layer.
 "9LeafClovers":{"physics":{"axial_force":0.022,"lateral_force":-0.186,"sensor_gain":4.346,"mutation_scale":0.236,"drag":0.125,"strafe_power":0.169,"sensor_angle":-0.141,"global_force_mult":0.94,"sensor_distance":1.013,"trail_persistence":0.943,"trail_diffusion":1,"hazard_rate":0},"settings":{"initial_conditions":1,"num_cohorts":1,"rule_seed":0.7792261563787203},"rule":[0.30871841311454773,0.2668111026287079,-0.40852031111717224,-0.10784289985895157,0.1341909021139145,1.0955612659454346,0.9584488868713379,0.03012336790561676,1.5596504211425781,-1.9704253673553467,-0.9177911877632141,-2.7063138484954834,-0.752485454082489,0.30377432703971863,-1.3242547512054443,-0.8374620676040649,0.48819229006767273,-2.4314217567443848,2.125211238861084,0.8107457756996155,-0.5121806859970093,1.0502769947052002,1.1394836902618408,2.000248670578003,1.0410889387130737,2.0637149810791016,-2.1589443683624268,-1.3367706537246704,-0.8152588605880737,-1.1830593347549438,-0.19745463132858276,1.4832735061645508,-0.4410875737667084,-1.7536864280700684,-1.5184026956558228,-1.4539422988891602,1.1246709823608398,0.8677715063095093,0.40814265608787537,0.49253296852111816,0.11196213215589523,0.8812480568885803,0.4935372769832611,-0.46708568930625916,-0.620029091835022,2.311511993408203,-0.9370143413543701,-1.4188916683197021,0.19754177331924438,0.4573211371898651,-1.0938060283660889,0.14238955080509186,-1.4590283632278442,0.2929561138153076,-0.4515392780303955,0.1683899164199829,0.5785334706306458,0.12711259722709656,1.4608304500579834,1.1861963272094727,-0.40854278206825256,-0.4413979152053833,0.8244497776031494,1.145101547241211,-0.42757052183151245,-0.23799845576286316,0.10154121369123459,0.3957122266292572,1.3221192359924316,-0.9881879091262817,-2.7022597789764404,1.2729225158691406,-0.28964725136756897,0.09492208063602448,0.5364229083061218,0.522319495677948,-0.07884250581264496,1.4948761463165283,-0.2380172610282898,1.1930195093154907]}}
 </script>
 <script src="config/configs.js"></script>
+<script src="config/textures.js"></script>
 <script type="module">
 const $ = id => document.getElementById(id);
 const errbox = $('err');
@@ -390,17 +393,9 @@ uniform int cohorts;
 uniform float sqrt_world_size;
 uniform vec2 tex_scale;
 uniform float u_solid;
-uniform float u_time;
+uniform int u_color_mode;   // 0 = paint the image by position, 1 = heading samples the colour strip (image palette or the artificial palette)
 out vec2 v_uv;
 out vec4 v_color;
-uint pcg_hash(uint seed){
-  uint state = seed * 747796405u + 2891336453u;
-  uint word = ((state >> ((state >> 28u) + 4u)) ^ state) * 277803737u;
-  return (word >> 22u) ^ word;
-}
-float hash_float(uint x){ return float(pcg_hash(x)) / float(0xffffffffu); }
-// The original 12-colour palette (hues the swarm was coloured with before heading mapping) - weighted toward blues/violets/magentas.
-const float PALETTE[12] = float[12](0.03, 0.18, 0.18, 0.23, 0.44, 0.56, 0.63, 0.63, 0.73, 0.79, 0.85, 0.90);
 void main(){
   ivec2 tc = ivec2(gl_InstanceID % entity_tex_width, gl_InstanceID / entity_tex_width);
   vec4 entity = texelFetch(entity_texture, tc, 0);
@@ -408,9 +403,9 @@ void main(){
   float size = SPRITE_SIZE * 0.0015 / sqrt_world_size;
   vec2 entity_vel = entity.zw;
   float heading = atan(entity_vel.y, entity_vel.x) * 0.15915494309 + 0.5;     // heading -> [0,1)
-  float hue = PALETTE[int(clamp(floor(heading * 12.0), 0.0, 11.0))];          // heading picks a colour from the original palette
-  hue = fract(hue + u_time * 0.01);                                          // slow global drift so the palette still ages
-  v_color = vec4(hue, 0.8, 1.0, mix(0.045, 1.0, u_solid));
+  vec2 uvc = (u_color_mode == 1) ? vec2(heading, 0.5)                         // palette: heading picks a colour from the strip
+                                 : vec2(entity_pos.x * 0.5 + 0.5, 0.5 - entity_pos.y * 0.5);  // paint: sample the image at the particle's position
+  v_color = vec4(uvc, 0.0, mix(0.045, 1.0, u_solid));
   vec2 offsets[4] = vec2[4](vec2(-size, -size), vec2(size, -size), vec2(size, size), vec2(-size, size));
   vec2 uv_coords[4] = vec2[4](vec2(0.0, 0.0), vec2(1.0, 0.0), vec2(1.0, 1.0), vec2(0.0, 1.0));
   bool visible = abs(entity_pos.x) <= 1.0 / tex_scale.x && abs(entity_pos.y) <= 1.0 / tex_scale.y;
@@ -427,11 +422,9 @@ out vec4 fragColor;
 uniform float brightness;
 uniform float u_hard;
 uniform float u_solid;
-vec3 hsv2rgb(vec3 c){
-  vec4 K = vec4(1.0, 2.0 / 3.0, 1.0 / 3.0, 3.0);
-  vec3 p = abs(fract(c.xxx + K.xyz) * 6.0 - K.www);
-  return c.z * mix(K.xxx, clamp(p - K.xxx, 0.0, 1.0), c.y);
-}
+uniform sampler2D u_color_tex;
+uniform sampler2D u_color_tex2;
+uniform float u_tex_mix;   // 0 = previous texture, 1 = current (crossfaded when the texture cycles)
 float gaussian(vec2 pos, float sigma){
   float sigma2 = sigma * sigma;
   float norm = 1.0 / (2.0 * 3.14159265359 * sigma2);
@@ -442,7 +435,8 @@ void main(){
   vec2 centered_uv = v_uv - 0.5;
   float kernel = u_hard > 0.5 ? 1.0 : 0.5 * gaussian(centered_uv, 0.163);
   if (u_hard < 0.5 && length(centered_uv) > 0.5) discard;
-  vec3 rgb = hsv2rgb(v_color.xyz) * brightness * mix(3.0, 1.0, u_solid);
+  vec3 base = mix(texture(u_color_tex, v_color.xy).rgb, texture(u_color_tex2, v_color.xy).rgb, u_tex_mix);
+  vec3 rgb = base * brightness * mix(3.0, 1.0, u_solid);
   fragColor = vec4(rgb, min(v_color.w * kernel, 1.0));
 }`;
 
@@ -534,7 +528,7 @@ function mutateOrganism(rule, amount, cohortSeed){
 let cfg = null;
 const app = { paused:false, view:'particles', blend:'solid', brightness:0.5,
               stepsPerFrame:1, simWorldSize:1.0, resetSeed:1,
-              hardPixels:false, accum:0.9, solidFade:0.998 };
+              hardPixels:false, accum:0.9, solidFade:0.998, colorMode:'palette' };
 // Auto-mode: hold each config for AUTO_DWELL seconds, then crossfade into the next one over
 // AUTO_FADE seconds, cycling the config/ files in a random order. Overridable via ?dwell=&fade=.
 // Enabling it crossfades in from the current view (no snap) and the organism seed stays fixed,
@@ -663,6 +657,86 @@ function createResources(){
   entityPing = 0; canvasPing = 0; frameCount = 0; ruleDirty = true; accumPing = 0;
 }
 
+// ---- colour textures ---------------------------------------------------------
+// Sources from config/textures.js (downscaled image + hue-sorted palette strip). Colour modes:
+//   'paint'   - sample the image at each particle's position (the swarm paints the artwork)
+//   'palette' - heading samples the image's palette strip (directional colour bands)
+//   'hue'     - heading samples the artificial palette (the original neon hues)
+const texLib = { src: [], cur: 0, prev: 0, mix: 1 };
+let artificialTex = null, flatGreyTex = null;
+const TEX_FADE_MS = 2500;
+const ARTIFICIAL_HUES = [0.03, 0.18, 0.18, 0.23, 0.44, 0.56, 0.63, 0.63, 0.73, 0.79, 0.85, 0.90];
+function hsv2rgbJS(h, s, v){
+  const f = n => { const k = (n + h) % 1; return v - v * s * Math.max(0, Math.min(1, Math.min(4 * k, 4 * (1 - k)))); };
+  return [f(0) * 255, f(2 / 3) * 255, f(1 / 3) * 255];
+}
+function uploadTex(image, wrap, nearest){
+  const t = gl.createTexture();
+  gl.bindTexture(gl.TEXTURE_2D, t);
+  gl.pixelStorei(gl.UNPACK_FLIP_Y_WEBGL, false);
+  gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, image);
+  const f = nearest ? gl.NEAREST : gl.LINEAR;
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, f);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, f);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, wrap);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+  return t;
+}
+function flatTex(r, g, b){
+  const t = gl.createTexture();
+  gl.bindTexture(gl.TEXTURE_2D, t);
+  gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, 1, 1, 0, gl.RGBA, gl.UNSIGNED_BYTE, new Uint8Array([r, g, b, 255]));
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.NEAREST);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.NEAREST);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+  return t;
+}
+function buildArtificial(){                      // 12x1 NEAREST strip -> heading picks a flat hue, exactly as before
+  const n = ARTIFICIAL_HUES.length, px = new Uint8Array(n * 4);
+  ARTIFICIAL_HUES.forEach((h, i) => { const c = hsv2rgbJS(h, 0.8, 1.0); px[i*4] = c[0]; px[i*4+1] = c[1]; px[i*4+2] = c[2]; px[i*4+3] = 255; });
+  const t = gl.createTexture();
+  gl.bindTexture(gl.TEXTURE_2D, t);
+  gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, n, 1, 0, gl.RGBA, gl.UNSIGNED_BYTE, px);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.NEAREST);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.NEAREST);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.REPEAT);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+  return t;
+}
+function loadTextures(){
+  const list = window.HYPERCELLS_TEXTURES;
+  if (!Array.isArray(list) || !list.length) return;
+  texLib.src = list.map(() => ({ img: null, pal: null }));
+  list.forEach((rec, i) => {
+    const e = texLib.src[i];
+    const a = new Image(); a.onload = () => { e.img = uploadTex(a, gl.CLAMP_TO_EDGE, false); }; a.src = rec.img;
+    const b = new Image(); b.onload = () => { e.pal = uploadTex(b, gl.REPEAT, false); }; b.src = rec.pal;
+  });
+}
+function colorTexFor(i){
+  if (app.colorMode === 'hue') return artificialTex;
+  const e = texLib.src[i];
+  if (e){ const t = app.colorMode === 'paint' ? e.img : e.pal; if (t) return t; }
+  return app.colorMode === 'paint' ? flatGreyTex : artificialTex;
+}
+function pickTexture(rand){
+  const n = texLib.src.length;
+  if (n < 2) return;
+  let k = texLib.cur;
+  if (rand){ do { k = Math.floor(Math.random() * n); } while (k === texLib.cur); }
+  else k = (texLib.cur + 1) % n;
+  texLib.prev = texLib.cur; texLib.cur = k; texLib.mix = 0;
+}
+function setColorMode(m){
+  app.colorMode = m;
+  $('bColor').textContent = 'color: ' + m;
+}
+function cycleColorMode(){
+  const order = ['palette', 'paint', 'hue'];
+  setColorMode(order[(order.indexOf(app.colorMode) + 1) % order.length]);
+}
+
 function setConfigUniforms(p){
   u4f(p, 'config_a', [cfg.cohorts, cfg.rule_seed, cfg.sensor_gain, cfg.sensor_angle]);
   u4f(p, 'config_b', [cfg.sensor_distance, cfg.mutation_scale, cfg.global_force_mult, cfg.drag]);
@@ -752,7 +826,10 @@ function spritePass(target){
   u1f(p, 'brightness', app.brightness);
   u1f(p, 'u_hard', app.hardPixels ? 1 : 0);
   u1f(p, 'u_solid', solid ? 1 : 0);
-  u1f(p, 'u_time', performance.now() * 0.001);
+  u1i(p, 'u_color_mode', app.colorMode === 'paint' ? 0 : 1);
+  u1f(p, 'u_tex_mix', texLib.mix);
+  bindTex(1, colorTexFor(texLib.prev), p, 'u_color_tex');
+  bindTex(2, colorTexFor(texLib.cur), p, 'u_color_tex2');
   gl.enable(gl.BLEND);
   // solid: premultiplied rgb + true coverage alpha (alpha was previously squared, then re-multiplied in COMP)
   if (solid) gl.blendFuncSeparate(gl.SRC_ALPHA, gl.ONE_MINUS_SRC_ALPHA, gl.ONE, gl.ONE_MINUS_SRC_ALPHA);
@@ -908,6 +985,10 @@ function addSlider(parent, key, label, min, max, step, fmt){
 
 initGL();
 createResources();
+artificialTex = buildArtificial();
+flatGreyTex = flatTex(128, 128, 128);
+loadTextures();
+setColorMode(app.colorMode);
 
 window.addEventListener('keydown', e => {
   if (e.target.tagName === 'INPUT' || e.target.tagName === 'SELECT') return;
@@ -920,6 +1001,8 @@ window.addEventListener('keydown', e => {
   else if (k === 'f') setView(app.view === 'particles' ? 'field' : 'particles');
   else if (k === 'p') setHard(!app.hardPixels);
   else if (k === 'b') setBlend(app.blend === 'solid' ? 'additive' : 'solid');
+  else if (k === 'c') cycleColorMode();
+  else if (k === 't') pickTexture(false);
   else if (k === 'a') toggleAuto();
 });
 
@@ -931,12 +1014,14 @@ $('bView').onclick = () => setView(app.view === 'particles' ? 'field' : 'particl
 $('bHard').onclick = () => setHard(!app.hardPixels);
 $('bBlend').onclick = () => setBlend(app.blend === 'solid' ? 'additive' : 'solid');
 $('bAuto').onclick = toggleAuto;
+$('bColor').onclick = cycleColorMode;
+$('bTex').onclick = () => pickTexture(false);
 setBlend(app.blend);
 function serializeState(){
   return { c: {...cfg, rule: Array.from(cfg.rule)},
            a: {view: app.view, blend: app.blend, brightness: app.brightness, simWorldSize: app.simWorldSize,
                stepsPerFrame: app.stepsPerFrame, hard: app.hardPixels, accum: app.accum, solidFade: app.solidFade,
-               seed: app.resetSeed} };
+               colorMode: app.colorMode, seed: app.resetSeed} };
 }
 function encodeState(obj){ return btoa(String.fromCharCode(...new TextEncoder().encode(JSON.stringify(obj)))); }
 function decodeState(b64){ return JSON.parse(new TextDecoder().decode(Uint8Array.from(atob(decodeURIComponent(b64)), ch => ch.charCodeAt(0)))); }
@@ -1028,6 +1113,7 @@ function applyState(s){
   setView(a.view === 'field' ? 'field' : 'particles');
   setHard(!!a.hard);
   setBlend(a.blend === 'additive' ? 'additive' : 'solid');
+  if (a.colorMode === 'hue' || a.colorMode === 'paint' || a.colorMode === 'palette') setColorMode(a.colorMode);
   ruleDirty = true;
   resetSim(a.seed);
   syncUI();
@@ -1123,6 +1209,7 @@ function setAuto(on){
     auto.cur = bagNext();
     auto.next = auto.cur;
     auto.to = auto.configs[auto.cur];
+    pickTexture(true);                               // start on a random colour texture
     if (auto.configs.length < 2){                    // nothing to cycle: just switch to it
       applyConfig(auto.to); auto.mode = 'dwell'; auto.t = 0;
       return;
@@ -1140,6 +1227,7 @@ function autoStep(dtms){
     auto.next = bagNext();
     auto.to = auto.configs[auto.next];
     setView(auto.to.a.view); setHard(auto.to.a.hard); setBlend(auto.to.a.blend);
+    pickTexture(true);                               // new colour texture with each config, crossfaded in
     auto.mode = 'fade'; auto.t = 0;
   } else {
     const u = Math.min(1, auto.t / AUTO_FADE);
@@ -1180,6 +1268,7 @@ let fpsEMA = 60, frameLast = 0;
 function frame(now){
   const dt = now - frameLast; frameLast = now;
   if (dt > 0 && dt < 1000) fpsEMA = fpsEMA * 0.95 + (1000/dt) * 0.05;
+  if (dt > 0 && dt < 1000 && texLib.mix < 1) texLib.mix = Math.min(1, texLib.mix + dt / TEX_FADE_MS);
   if (!app.paused){
     const n = app.stepsPerFrame|0;
     for (let i = 0; i < n; i++) advance();
