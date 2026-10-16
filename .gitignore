@@ -1,0 +1,6 @@
+# raw captures — huge media that must never be committed
+recordings/
+
+# misc editor/system noise
+Thumbs.db
+.DS_Store

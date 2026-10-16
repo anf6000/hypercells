@@ -434,6 +434,11 @@ void main(){
   fragColor = vec4(rgb, min(v_color.w * kernel, 1.0) * u_opacity);
 }`;
 
+// Accumulation is TRAIL PERSISTENCE, not an exposure average:
+//   0 = the buffer keeps nothing, so only the live frame shows (no trails)
+//   1 = the buffer is never cleared, so every mark stays where it was painted
+// The live frame is always drawn at full strength -- only how much of what is already on the
+// buffer survives is scaled by the slider -- so the picture can never dim or freeze.
 const COMP_FS = `#version 300 es
 precision highp float;
 uniform sampler2D view_tex;
@@ -443,8 +448,10 @@ in vec2 uv; out vec4 o;
 void main(){
   vec4 v = texture(view_tex, uv);
   vec4 a = texture(accum_tex, uv);
-  float sa = clamp(v.a * accum_amount, 0.0, 1.0);
-  o = vec4(v.rgb * accum_amount + a.rgb * (1.0 - sa), max(sa, a.a));
+  // the buffer is kept, faded by the slider, and this frame is painted over it
+  float keep = clamp(accum_amount, 0.0, 1.0);
+  float va = clamp(v.a, 0.0, 1.0);
+  o = vec4(v.rgb + a.rgb * keep * (1.0 - va), va + a.a * keep * (1.0 - va));
 }`;
 
 const PRESENT_FS = `#version 300 es
@@ -781,7 +788,7 @@ function render(){
     gl.drawArrays(gl.TRIANGLES, 0, 6);
   }
   let sceneTex = sceneBufTex;
-  if (!app.paused && app.accum > 0.002){
+  if (!app.paused){   // keep = 0 already yields the live frame, so the slider is continuous from 0
     const p = progComp;
     gl.useProgram(p);
     const r = accumPing, wr = 1 - r;

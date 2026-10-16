@@ -393,8 +393,13 @@ const server = http.createServer(async (req, res) => {
     if (req.method === 'GET'){
       const name = p === '/' ? '/hypercells-evolve.html' : p;
       if (/^\/[\w.-]+\.html$/.test(name)){
-        const f = path.join(ROOT, name.slice(1));
-        if (fs.existsSync(f)) return send(res, 200, await fsp.readFile(f), 'text/html; charset=utf-8');
+        const base = name.slice(1);
+        // the app pages live one folder down now (color/, hypercells-4k/, evolve/, ...):
+        // serve them from the project root first, then from this folder (hypercells-evolve.html)
+        for (const dir of [ROOT, HERE]){
+          const f = path.join(dir, base);
+          if (fs.existsSync(f)) return send(res, 200, await fsp.readFile(f), 'text/html; charset=utf-8');
+        }
       }
     }
     send(res, 404, 'not found', 'text/plain');

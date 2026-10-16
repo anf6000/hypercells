@@ -1,0 +1,1028 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>hypercells — documentation</title>
+<meta name="description" content="How the hypercells simulation works, what every control does, and how the controls interact.">
+<link rel="stylesheet" href="assets/site.css">
+</head>
+<body>
+
+<div class="bar">
+  <span class="brand">hypercells</span>
+  <span class="crumb">documentation</span>
+  <span class="chip accent">autopilot.html</span>
+  <span class="chip muted">autopilot-4k.html</span>
+  <a class="chip muted" href="#settings">settings</a>
+  <a class="chip muted" href="#captures">captures</a>
+</div>
+
+<div class="layout">
+
+  <nav class="toc" aria-label="Contents">
+    <h2>Contents</h2>
+    <ol>
+      <li><a href="#overview">Overview</a></li>
+      <li><a href="#loop">The simulation loop</a>
+        <div class="sub">
+          <a href="#step">Life of one step</a>
+          <a href="#steer">Sense and steer</a>
+          <a href="#two-memories">Two memories</a>
+          <a href="#rules">Rules and cohorts</a>
+        </div>
+      </li>
+      <li><a href="#autopilot">The autopilot</a>
+        <div class="sub">
+          <a href="#hold-morph">Hold and morph</a>
+          <a href="#candidates">Candidates</a>
+          <a href="#metrics">Metrics and the good band</a>
+          <a href="#health">The health monitor</a>
+          <a href="#guards">Guards and limits</a>
+        </div>
+      </li>
+      <li><a href="#colour">Colour</a></li>
+      <li><a href="#settings">Settings reference</a>
+        <div class="sub">
+          <a href="#s-autopilot">Autopilot</a>
+          <a href="#s-physics">Physics</a>
+          <a href="#s-world">Organism and world</a>
+          <a href="#s-render">Render</a>
+          <a href="#s-buttons">Buttons and keys</a>
+        </div>
+      </li>
+      <li><a href="#interactions">How the settings interact</a></li>
+      <li><a href="#interface">The interface</a></li>
+      <li><a href="#captures">Captures</a></li>
+      <li><a href="#perf">Performance and the 4K build</a></li>
+      <li><a href="#appendix">Appendix: constants</a></li>
+    </ol>
+  </nav>
+
+  <main>
+
+  <h1>hypercells — documentation</h1>
+  <p class="lede">hypercells is a GPU simulation of a swarm that draws itself. Hundreds of
+  thousands of particles each sense a faint velocity field left behind by their neighbours,
+  pass those two readings through a small Fourier rule, and steer. What they deposit is the
+  field they read: the artwork is the flock's own memory.</p>
+
+  <p>This document explains the loop, the autopilot that steers the swarm through parameter
+  space on its own, and every control in the panel — what it does in the maths, and which
+  other controls it fights or reinforces.</p>
+
+  <figure>
+    <img src="media/hero.webp" alt="A hypercells frame: filaments of green, violet and magenta looping through a dark field." class="shot">
+    <figcaption><b>The full-bleed build.</b> <code>autopilot-4k.html</code> at 3840×2160: the
+    field is the window, every particle is one pixel. Captured from the recordings in
+    <code>recordings/</code>.</figcaption>
+  </figure>
+
+  <!-- ══════════════════════════════════════════════════════════════════════ -->
+  <h2 id="overview">1 · Overview</h2>
+
+  <p>There is no drawing and no physics engine. There are two textures and a handful of
+  fragment shaders, run twice per displayed frame:</p>
+
+  <ul>
+    <li><b>the entity texture</b> holds one particle per texel — position in <code>xy</code>,
+    velocity in <code>zw</code>. At the default world size that is 600 000 texels; the 4K build
+    runs 1 000 000, and the largest setting 2 000 000.</li>
+    <li><b>the field</b> is a square or screen-shaped texture the same resolution as the output
+    canvas. It is what particles write (a soft dot of their velocity) and what they read (two
+    samples, left and right of their heading).</li>
+  </ul>
+
+  <p>Each step, every particle reads the field at two points, turns the pair of readings into a
+  force and a sideways push through its cohort's rule, and moves. The dot it leaves behind is
+  the only thing that makes its behaviour visible, and it is also the only thing that steers
+  its neighbours.</p>
+
+  <div class="note">
+    <b>Two files, one engine.</b> <code>autopilot.html</code> is the reference build:
+    1024-texel square field, letterboxed, 600 000 particles, soft sprites.
+    <code>autopilot-4k.html</code> is the same engine with seven settings changed — 2160-texel
+    full-screen field, 1M particles, hard single-pixel sprites. They differ by a header of
+    constants, nothing else; see <a href="#perf">Performance</a>.
+  </div>
+
+  <!-- ══════════════════════════════════════════════════════════════════════ -->
+  <h2 id="loop">2 · The simulation loop</h2>
+
+  <h3 id="step">Life of one step</h3>
+
+  <p>Two steps run per animation frame, always exactly two, never more. (Even numbers matter:
+  with negative drag a single step can overshoot and the pair corrects it.) The order is fixed,
+  and the order is the mechanism — the field a particle senses is the one its neighbours wrote
+  in the <em>previous</em> step.</p>
+
+  <figure>
+    <svg viewBox="0 0 1000 268" role="img" aria-label="Pipeline: entity texture into the sense-and-steer kernel, which reads the field and writes a deposit, into the field, into accumulation, into present.">
+      <rect class="box" x="8" y="44" width="164" height="66"/>
+      <text x="90" y="68" class="mid">entity texture</text>
+      <text x="90" y="85" class="mid m">pos.xy  vel.zw</text>
+      <text x="90" y="100" class="mid m">1 texel each</text>
+
+      <rect class="accentbox" x="206" y="44" width="192" height="66"/>
+      <text x="302" y="68" class="mid">sense &amp; steer</text>
+      <text x="302" y="85" class="mid m">2 samples + Fourier rule</text>
+      <text x="302" y="100" class="mid m">one fragment per particle</text>
+
+      <rect class="box" x="432" y="44" width="176" height="66"/>
+      <text x="520" y="68" class="mid">field</text>
+      <text x="520" y="85" class="mid m">persistence × old</text>
+      <text x="520" y="100" class="mid m">+ deposit</text>
+
+      <rect class="box" x="642" y="44" width="164" height="66"/>
+      <text x="724" y="68" class="mid">accumulation</text>
+      <text x="724" y="85" class="mid m">keep = accumulation</text>
+      <text x="724" y="100" class="mid m">long exposure</text>
+
+      <rect class="box" x="840" y="44" width="152" height="66"/>
+      <text x="916" y="68" class="mid">present</text>
+      <text x="916" y="85" class="mid m">1:1 or fitted</text>
+      <text x="916" y="100" class="mid m">full bleed / letterbox</text>
+
+      <line class="wire" x1="172" y1="77" x2="204" y2="77" marker-end="url(#ar)"/>
+      <line class="wire" x1="398" y1="77" x2="430" y2="77" marker-end="url(#ar)"/>
+      <line class="wire" x1="608" y1="77" x2="640" y2="77" marker-end="url(#ar)"/>
+      <line class="wire" x1="806" y1="77" x2="838" y2="77" marker-end="url(#ar)"/>
+
+      <path class="wire-a" d="M520 110 L520 178 L302 178 L302 112" marker-end="url(#ara)"/>
+      <text x="404" y="196" class="mid a">the deposit is what the sensors read</text>
+      <text x="404" y="212" class="mid m">one step of delay: neighbours' previous step</text>
+
+      <line class="thin" x1="8" y1="238" x2="992" y2="238"/>
+      <text x="8" y="256" class="m">2 steps per frame, fixed</text>
+      <text x="992" y="256" class="end m">then the frame is tonemapped and presented</text>
+
+      <defs>
+        <marker id="ar" markerWidth="7" markerHeight="7" refX="6" refY="3.5" orient="auto">
+          <path d="M0,0 L7,3.5 L0,7 z" fill="#000"/>
+        </marker>
+        <marker id="ara" markerWidth="7" markerHeight="7" refX="6" refY="3.5" orient="auto">
+          <path d="M0,0 L7,3.5 L0,7 z" fill="#0000ff"/>
+        </marker>
+      </defs>
+    </svg>
+    <figcaption><b>The loop.</b> The entity kernel writes positions and velocities; the field
+    pass turns each particle into a small deposit. The blue path is the feedback that makes the
+    whole thing an artwork rather than a particle system.</figcaption>
+  </figure>
+
+  <h3 id="steer">Sense and steer</h3>
+
+  <p>This is the part that decides everything the swarm looks like. A particle has a heading
+  (its velocity, normalised). It samples the field at two points placed
+  <code>sensor&nbsp;dist</code> ahead of it, swung <code>±sensor&nbsp;angle</code> off the
+  heading. The two readings are multiplied by <code>sensor&nbsp;gain</code> and fed to its
+  cohort's Fourier rule, which returns a force and a sideways push.</p>
+
+  <figure>
+    <svg viewBox="0 0 1000 440" role="img" aria-label="A particle's two sensors either side of its heading, the sensed values, the resulting force and strafe, and the drag that decays velocity.">
+      <rect class="accentbox" x="24" y="36" width="306" height="92"/>
+      <text x="177" y="58" class="mid">Fourier rule — 10 centres</text>
+      <text x="177" y="76" class="mid m">4 signals in → force.xy + strafe.zw</text>
+      <text x="177" y="94" class="mid m">evaluated mirrored, so the swarm is</text>
+      <text x="177" y="112" class="mid m">symmetric about its own heading</text>
+
+      <rect class="box" x="24" y="164" width="156" height="76"/>
+      <text x="102" y="188" class="mid">sensor gain</text>
+      <text x="102" y="206" class="mid m">×0.02 … 12</text>
+      <text x="102" y="224" class="mid m">scales both taps</text>
+      <line class="thin" x1="180" y1="202" x2="374" y2="202" marker-end="url(#ar)"/>
+
+      <circle class="dash" cx="450" cy="260" r="74"/>
+      <text x="290" y="374" class="mid m">deposit — σ 0.163 texels, drawn by every neighbour</text>
+
+      <line class="wire" x1="450" y1="260" x2="676" y2="260" marker-end="url(#ar)"/>
+      <text x="600" y="250" class="mid m">heading (velocity)</text>
+
+      <line class="wire" x1="450" y1="260" x2="610" y2="150" marker-end="url(#ar)"/>
+      <line class="wire" x1="450" y1="260" x2="610" y2="370" marker-end="url(#ar)"/>
+      <circle class="dot" cx="610" cy="150" r="4.5"/>
+      <circle class="dot" cx="610" cy="370" r="4.5"/>
+      <text x="620" y="148" class="a">L sample</text>
+      <text x="620" y="374" class="a">R sample</text>
+
+      <path class="thin" d="M490 260 A40 40 0 0 0 483 237"/>
+      <path class="thin" d="M490 260 A40 40 0 0 1 483 283"/>
+      <line class="thin" x1="474" y1="252" x2="484" y2="240"/>
+      <line class="thin" x1="474" y1="268" x2="484" y2="280"/>
+
+      <line class="wire-a" x1="640" y1="196" x2="700" y2="196" marker-end="url(#ara)"/>
+      <text x="670" y="188" class="mid a">force</text>
+
+      <rect class="box" x="706" y="30" width="280" height="96"/>
+      <text x="846" y="52" class="mid">then, per step</text>
+      <text x="846" y="74" class="mid m">vel = vel × drag + force</text>
+      <text x="846" y="94" class="mid m">pos += vel + strafe × strafe power</text>
+      <text x="846" y="114" class="mid m">|vel| capped · pos wrapped</text>
+
+      <rect class="box" x="706" y="164" width="280" height="76"/>
+      <text x="846" y="188" class="mid">drag</text>
+      <text x="846" y="208" class="mid m">the control that decides whether</text>
+      <text x="846" y="226" class="mid m">force accumulates or is forgotten</text>
+
+      <line class="thin" x1="24" y1="392" x2="990" y2="392"/>
+      <text x="24" y="412" class="m">sensor dist — the length of the two sensor lines above: how far ahead of the particle the taps sit. Compared to the deposit radius it is R.</text>
+      <text x="24" y="430" class="m">sensor angle — how far off the heading the taps swing. Small = watching its own path; large = watching across it.</text>
+    </svg>
+    <figcaption><b>Sense and steer.</b> <code>sensor&nbsp;dist</code> is compared to the deposit
+    size rather than to the canvas — see <a href="#metrics">R</a> — because a sensor closer than
+    one deposit radius reads its own trail and the particle stalls.</figcaption>
+  </figure>
+
+  <h3 id="two-memories">Two memories</h3>
+
+  <p>Two controls are called "persistence" in spirit and they do entirely different things. This
+  is the most common source of confusion in the panel.</p>
+
+  <div class="grid two">
+    <div class="card">
+      <div class="head"><h3>the field's persistence</h3><span class="muted small">Physics section</span></div>
+      <p>How much of last step's field survives into this one. It is the <b>steering</b> memory:
+      raise it and the swarm follows trails laid many steps ago, so it moves more slowly and
+      coherently and carves longer filaments. Value in the panel is clamped to
+      <code>0.95 … 0.998</code>; the deposit strength is coupled to it as
+      <code>1 − persistence</code>, so a longer memory deposits less per step to compensate.</p>
+    </div>
+    <div class="card">
+      <div class="head"><h3>accumulation</h3><span class="muted small">Render section</span></div>
+      <p>How much of the <b>displayed</b> image survives. It is long exposure, not
+      physics: <code>0</code> shows only the live frame, <code>1</code> never clears, so every
+      mark stays where it was painted and the canvas fills into a permanent painting. It cannot
+      change how the swarm moves — only what you see of where it has been.</p>
+    </div>
+  </div>
+
+  <figure>
+    <svg viewBox="0 0 1000 350" role="img" aria-label="Pixel brightness over successive frames for four accumulation settings, showing convergence towards a limit that scales as one over one minus keep.">
+      <line class="thin" x1="110" y1="296" x2="884" y2="296"/>
+      <line class="thin" x1="110" y1="46" x2="110" y2="296"/>
+      <text x="104" y="300" class="end m">0</text>
+      <text x="104" y="175" class="end m">1.0</text>
+      <text x="104" y="50" class="end m">2.0</text>
+      <line class="grid-line" x1="110" y1="171" x2="884" y2="171"/>
+      <text x="110" y="36" class="m">brightness of a pixel that the swarm crosses once per step</text>
+
+      <path class="wire-a" d="M110 296 L884 296"/>
+      <path class="wire-a" d="M110 296 Q150 227 242 227 L884 227"/>
+      <path class="wire" d="M110 296 C 200 296 260 171 420 171 L884 171"/>
+      <path class="wire" d="M110 296 C 180 296 220 46 300 46 L884 46"/>
+
+      <text x="892" y="300" class="a tiny">keep 0</text>
+      <text x="892" y="231" class="a tiny">keep 0.5</text>
+      <text x="892" y="175" class="tiny">keep 0.93</text>
+      <text x="892" y="50" class="tiny">keep 1</text>
+
+      <text x="600" y="92" class="mid m">a pixel lit once per step settles at  value ÷ (1 − keep)</text>
+      <text x="600" y="112" class="mid m">so raising the slider raises the whole image: exposure and brightness are felt together</text>
+      <text x="600" y="132" class="mid m">trail length ≈ 1 ÷ (1 − keep) frames — 0.93 ≈ 14 frames, about a quarter second at 60 fps</text>
+
+      <text x="497" y="320" class="mid m">frames since the particle moved on</text>
+      <text x="24" y="320" class="m">0 = no trails</text>
+      <text x="24" y="338" class="m">1 = never cleared</text>
+    </svg>
+    <figcaption><b>Long exposure.</b> The live frame is always drawn at full strength, so the
+    slider never dims the picture and never freezes it — but because each frame is kept, a busy
+    pixel piles up and the image brightens towards saturation as
+    <code>accumulation → 1</code>.</figcaption>
+  </figure>
+
+  <h3 id="rules">Rules and cohorts</h3>
+
+  <p>A "rule" is ten four-dimensional Fourier centres: the small function that maps the two
+  sensor readings to a force. Ten centres, four components each, is 80 floats — the entire
+  behaviour of one organism.</p>
+
+  <p><code>cohorts</code> splits the swarm into that many groups, each running its <em>own</em>
+  rule, taken from the base rule by a stable mutation seeded with <code>seed + cohort index</code>.
+  The rules are computed on the CPU and uploaded as a 24×20 float texture; the shader looks its
+  own column up with <code>texelFetch</code>. Twelve cohorts therefore means twelve variants of
+  one organism sharing a field — they compete for the same trails, which is where the fine
+  multi-coloured texture in the captures comes from.</p>
+
+  <figure>
+    <svg viewBox="0 0 1000 250" role="img" aria-label="The rule texture: twenty rows of four floats, one column per cohort, seeded by rule seed plus cohort index.">
+      <text x="30" y="26" class="m">rule texture — 24 columns × 20 rows, RGBA32F, one texel per float</text>
+
+      <rect class="track" x="30" y="44" width="560" height="150"/>
+      <rect class="band" x="30" y="44" width="70" height="150"/>
+      <rect class="band" x="100" y="44" width="70" height="150"/>
+      <line class="grid-line" x1="170" y1="44" x2="170" y2="194"/>
+      <line class="grid-line" x1="240" y1="44" x2="240" y2="194"/>
+      <line class="grid-line" x1="310" y1="44" x2="310" y2="194"/>
+      <line class="grid-line" x1="380" y1="44" x2="380" y2="194"/>
+      <line class="grid-line" x1="450" y1="44" x2="450" y2="194"/>
+      <line class="grid-line" x1="520" y1="44" x2="520" y2="194"/>
+      <line class="grid-line" x1="30" y1="81" x2="590" y2="81"/>
+      <line class="grid-line" x1="30" y1="118" x2="590" y2="118"/>
+      <line class="grid-line" x1="30" y1="155" x2="590" y2="155"/>
+      <line class="thin" x1="30" y1="44" x2="590" y2="44"/>
+      <line class="thin" x1="30" y1="194" x2="590" y2="194"/>
+
+      <text x="65" y="212" class="mid m">cohort 0</text>
+      <text x="135" y="212" class="mid m">cohort 1</text>
+      <text x="400" y="212" class="mid m">… 24 columns available</text>
+
+      <text x="620" y="60" class="tiny">20 rows × 4 floats = 80 floats</text>
+      <text x="620" y="78" class="tiny">= 10 Fourier centres, each with a</text>
+      <text x="620" y="96" class="tiny">frequency row and an amplitude row</text>
+      <text x="620" y="128" class="tiny">one column = one organism</text>
+      <text x="620" y="146" class="tiny">column k is seeded with seed + k</text>
+      <text x="620" y="164" class="tiny">never with a hash of the rule itself</text>
+      <text x="620" y="182" class="tiny">so a rule can be morphed without the</text>
+      <text x="620" y="200" class="tiny">cohorts re-randomising mid-glide</text>
+    </svg>
+    <figcaption><b>Cohorts.</b> Keeping the mutation seed independent of the current rule is
+    what makes the autopilot's glides possible: morph between two rules and every cohort follows
+    continuously instead of flickering to a new random organism on each change.</figcaption>
+  </figure>
+
+  <!-- ══════════════════════════════════════════════════════════════════════ -->
+  <h2 id="autopilot">3 · The autopilot</h2>
+
+  <p>The swarm is not steered by hand in this build. The autopilot walks it through parameter
+  space: it picks a destination, glides there slowly, holds, watches what happens, and decides
+  where to go next. It is on by default; <kbd>a</kbd> toggles it and any slider you touch
+  removes itself from its control.</p>
+
+  <h3 id="hold-morph">Hold and morph</h3>
+
+  <p>Two phases alternate. In <b>hold</b> nothing changes and the swarm is allowed to settle —
+  trails build, the field reaches equilibrium. Then <b>morph</b> glides every unlocked parameter
+  towards the destination over <code>morph time</code>, with a smootherstep easing so the ends
+  of the glide are gentle.</p>
+
+  <figure>
+    <svg viewBox="0 0 1000 240" role="img" aria-label="Timeline alternating hold and morph phases, with an eased parameter curve inside each morph.">
+      <line class="thin" x1="30" y1="150" x2="970" y2="150"/>
+      <text x="970" y="168" class="end m">time</text>
+
+      <rect class="band" x="30" y="120" width="170" height="30"/>
+      <text x="115" y="140" class="mid">hold 25 s</text>
+
+      <rect class="track" x="200" y="120" width="300" height="30"/>
+      <text x="350" y="140" class="mid">morph 45 s</text>
+
+      <rect class="band" x="500" y="120" width="130" height="30"/>
+      <text x="565" y="140" class="mid">hold</text>
+
+      <rect class="track" x="630" y="120" width="300" height="30"/>
+      <text x="780" y="140" class="mid">morph</text>
+
+      <path class="wire-a" d="M200 96 C 275 96 275 96 350 60 C 425 96 425 96 500 96"/>
+      <text x="350" y="48" class="mid a">smootherstep: 0 → 1</text>
+      <circle class="dot" cx="200" cy="96" r="3.5"/>
+      <circle class="dot" cx="500" cy="96" r="3.5"/>
+      <text x="200" y="86" class="mid m tiny">state A</text>
+      <text x="500" y="86" class="mid m tiny">state B</text>
+
+      <line class="thin" x1="30" y1="192" x2="970" y2="192" stroke-dasharray="4 3"/>
+      <text x="30" y="210" class="m">during a morph the clock can slow down: bad health stretches the glide (see the health monitor)</text>
+      <text x="30" y="228" class="m">a very short morph time does not make it faster — the slew limits below cap the speed regardless</text>
+    </svg>
+    <figcaption><b>The rhythm.</b> <code>morph time</code> 5–180 s, <code>hold time</code>
+    5–120 s. Long holds are what let the field settle into the shapes in the captures; short
+    holds make the piece a slideshow of states that never quite form.</figcaption>
+  </figure>
+
+  <h3 id="candidates">Candidates</h3>
+
+  <p>At the end of a hold the autopilot chooses a destination by <code>exploration</code>:</p>
+
+  <table>
+    <thead><tr><th>Draw</th><th>Destination</th><th>Effect</th></tr></thead>
+    <tbody>
+      <tr><td class="num">1 − exploration</td><td>a real anchor</td>
+        <td>One of the seventeen configurations the project was tuned on (the entries in
+        <code>config/configs.js</code> plus the three presets). A reliable, known-good look.</td></tr>
+      <tr><td class="num">exploration</td><td>a generated candidate</td>
+        <td>Two or three anchors are picked, blended in encoded parameter space, nudged with
+        Gaussian noise, then projected back into the good band. New territory near known
+        territory.</td></tr>
+      <tr><td class="num">one in eight</td><td>the other family</td>
+        <td>Family A (sensor gain below 2.2) and family B are qualitatively different animals —
+        low-gain drifting versus high-gain nervous systems. Occasionally the autopilot crosses
+        between them on purpose.</td></tr>
+    </tbody>
+  </table>
+
+  <p>By default the destination is a known-good state. <code>exploration</code> at 1 means every
+  destination is invented, which is where the piece finds its more unusual frames — and where it
+  occasionally finds a dead one, which is what the health monitor is for.</p>
+
+  <figure>
+    <svg viewBox="0 0 1000 300" role="img" aria-label="Autopilot decision loop: choose candidates, glide, hold, measure health, then save, pull back, or abandon and blacklist.">
+      <rect class="accentbox" x="10" y="60" width="176" height="74"/>
+      <text x="98" y="84" class="mid">choose</text>
+      <text x="98" y="102" class="mid m">anchor or generated</text>
+      <text x="98" y="120" class="mid m">blend → noise → project</text>
+
+      <rect class="box" x="212" y="60" width="168" height="74"/>
+      <text x="296" y="84" class="mid">glide</text>
+      <text x="296" y="102" class="mid m">smootherstep over</text>
+      <text x="296" y="120" class="mid m">morph time</text>
+
+      <rect class="box" x="406" y="60" width="150" height="74"/>
+      <text x="481" y="84" class="mid">hold</text>
+      <text x="481" y="102" class="mid m">watch the field</text>
+      <text x="481" y="120" class="mid m">settle</text>
+
+      <rect class="accentbox" x="582" y="60" width="182" height="74"/>
+      <text x="673" y="84" class="mid">health monitor</text>
+      <text x="673" y="102" class="mid m">mean |field| and fizz</text>
+      <text x="673" y="120" class="mid m">32 × 32 readback</text>
+
+      <line class="wire" x1="186" y1="97" x2="210" y2="97" marker-end="url(#ar)"/>
+      <line class="wire" x1="380" y1="97" x2="404" y2="97" marker-end="url(#ar)"/>
+      <line class="wire" x1="556" y1="97" x2="580" y2="97" marker-end="url(#ar)"/>
+
+      <rect class="box" x="790" y="18" width="200" height="58"/>
+      <text x="890" y="40" class="mid">good — keep going</text>
+      <text x="890" y="58" class="mid m">saved as a good find</text>
+      <line class="wire-a" x1="764" y1="80" x2="788" y2="52" marker-end="url(#ara)"/>
+
+      <rect class="box" x="786" y="92" width="204" height="58"/>
+      <text x="890" y="114" class="mid">bad — nudge back</text>
+      <text x="888" y="132" class="mid m">pull to last good, slow the clock</text>
+      <line class="wire" x1="764" y1="104" x2="788" y2="112" marker-end="url(#ar)"/>
+
+      <rect class="box" x="786" y="166" width="204" height="58"/>
+      <text x="890" y="188" class="mid">dead &gt; 5 s — abandon</text>
+      <text x="888" y="206" class="mid m">blacklist, fall back to an anchor</text>
+      <line class="wire" x1="764" y1="126" x2="788" y2="184" marker-end="url(#ar)"/>
+
+      <path class="wire-a" d="M890 234 L890 262 L98 262 L98 136" marker-end="url(#ara)"/>
+      <text x="494" y="280" class="mid a">next destination</text>
+    </svg>
+    <figcaption><b>The control loop.</b> Nothing in the loop judges beauty; it judges
+    <em>aliveness</em> — whether the field is still moving and not yet boiling — and retries.</figcaption>
+  </figure>
+
+  <h3 id="metrics">Metrics and the good band</h3>
+
+  <p>Every configuration, anchor or generated, is summarised by three derived numbers. They are
+  the autopilot's notion of "what kind of organism is this", and they are what the good band is
+  built from:</p>
+
+  <table>
+    <thead><tr><th>Symbol</th><th>Formula</th><th>Reads as</th></tr></thead>
+    <tbody>
+      <tr><td><b>G</b></td><td><code>sensor gain</code></td><td>how loudly the swarm hears its own field</td></tr>
+      <tr><td><b>V</b></td><td><code>|force| ÷ (1 − |drag|)</code></td><td>terminal speed the swarm wants to reach</td></tr>
+      <tr><td><b>P</b></td><td><code>G × V</code></td><td>overall drive — gain times speed</td></tr>
+      <tr><td><b>R</b></td><td><code>sensor dist ÷ 0.163</code></td><td>sensor reach, measured in deposit radii</td></tr>
+    </tbody>
+  </table>
+
+  <p><b>R is the important one.</b> Below about 1 the sensors sit inside the deposit a single
+  neighbour makes, so they read their own trail: particles glue to their own marks, the field
+  goes static, and the health monitor calls it dead. That is why <code>sensor dist</code> and
+  the deposit size — which is fixed at σ 0.163 texels and only changes with the field
+  resolution — have to be understood together.</p>
+
+  <figure>
+    <svg viewBox="0 0 1000 360" role="img" aria-label="The seventeen anchor configurations plotted as sensor reach against drive, with each family's good band.">
+      <line class="thin" x1="150" y1="302" x2="948" y2="302"/>
+      <line class="thin" x1="150" y1="44" x2="150" y2="302"/>
+      <text x="142" y="48" class="end m">P</text>
+      <text x="549" y="326" class="mid m">R — sensor reach in deposit radii</text>
+
+      <text x="401" y="32" class="mid m">R = 0 — sensors read their own deposit</text>
+      <line class="dash" x1="401.4" y1="44" x2="401.4" y2="302"/>
+
+      <rect class="band" x="230.5" y="52.8" width="707.2" height="223.2"/>
+      <rect class="band" x="195.0" y="247.9" width="407.1" height="11.8"/>
+      <text x="933.7" y="46.8" class="end a tiny">family B band</text>
+      <text x="152" y="234" class="tiny">family A band</text>
+
+      <circle class="dot" cx="242.0" cy="257.6" r="4.5"/>
+      <circle class="dot" cx="242.0" cy="257.6" r="4.5"/>
+      <circle class="dot" cx="312.0" cy="112.4" r="4.5"/>
+      <circle class="dot" cx="242.0" cy="256.8" r="4.5"/>
+      <circle class="dot" cx="856.0" cy="172.9" r="4.5"/>
+      <circle class="dot" cx="856.0" cy="168.3" r="4.5"/>
+      <circle class="dot" cx="856.0" cy="78.5" r="4.5"/>
+      <circle class="dot" cx="856.0" cy="88.8" r="4.5"/>
+      <circle class="dot" cx="653.0" cy="105.4" r="4.5"/>
+      <circle class="dot" cx="657.5" cy="96.2" r="4.5"/>
+      <circle class="dot" cx="657.5" cy="230.5" r="4.5"/>
+      <circle class="dot" cx="657.5" cy="205.0" r="4.5"/>
+      <circle class="dot" cx="657.5" cy="205.0" r="4.5"/>
+      <circle class="dot" cx="657.5" cy="205.0" r="4.5"/>
+      <circle class="dot" cx="242.0" cy="249.3" r="4.5"/>
+      <circle class="dot" cx="554.9" cy="258.3" r="4.5"/>
+      <circle class="dot" cx="554.9" cy="250.3" r="4.5"/>
+
+      <text x="549" y="346" class="mid m">each dot is one anchor — coincident dots are identical anchors</text>
+    </svg>
+    <figcaption><b>The good band.</b> Measured from all seventeen anchors, padded 15 %. A
+    generated candidate that lands outside is projected back in: <code>R</code> is clamped
+    directly, and <code>sensor gain</code> is then recomputed so that <code>P</code> lands inside
+    too. The bands are wide because the anchors disagree — that is the point.</figcaption>
+  </figure>
+
+  <h3 id="health">The health monitor</h3>
+
+  <p>The field itself is read back to the CPU every 30 steps (32 × 32 box-averaged, through a
+  pixel buffer so it never stalls the GPU) and reduced to two numbers:</p>
+
+  <ul>
+    <li><b>mean</b> — the average magnitude of the field. Its running reference decays slowly,
+    so the monitor compares the field to what this configuration was recently doing.</li>
+    <li><b>fizz</b> — how much the field changed since the last read, divided by its own mean.
+    A calm field has low fizz; a boiling one has high fizz.</li>
+  </ul>
+
+  <figure>
+    <svg viewBox="0 0 1000 300" role="img" aria-label="The health plane: mean field strength against fizz ratio, with the dead region below, the boiling region above, and the good region between.">
+      <rect class="track" x="110" y="40" width="800" height="200"/>
+      <rect class="band" x="110" y="40" width="800" height="46"/>
+      <text x="500" y="68" class="mid">boiling — fizz ÷ mean &gt; 0.55</text>
+      <rect class="band" x="110" y="146" width="800" height="94"/>
+      <text x="500" y="198" class="mid">good — the swarm is moving and coherent</text>
+      <line class="dash" x1="206" y1="86" x2="206" y2="240"/>
+      <text x="212" y="234" class="tiny m">dead — mean &lt; 12 % of reference</text>
+
+      <circle class="dot" cx="150" cy="200" r="4"/>
+      <circle class="dot" cx="230" cy="182" r="4"/>
+      <circle class="dot" cx="330" cy="166" r="4"/>
+      <circle class="dot" cx="450" cy="152" r="4"/>
+      <circle class="dot" cx="560" cy="120" r="4"/>
+      <circle class="dot" cx="650" cy="96" r="4"/>
+      <circle class="dot" cx="720" cy="66" r="4"/>
+      <path class="wire-a" d="M150 200 L230 182 L330 166 L450 152 L560 120 L650 96"/>
+      <path class="wire" d="M650 96 L720 66" marker-end="url(#ar)"/>
+      <text x="726" y="60" class="a tiny">rejected</text>
+
+      <line class="thin" x1="110" y1="258" x2="910" y2="258"/>
+      <text x="110" y="276" class="m">mean |field| →</text>
+      <text x="500" y="294" class="mid m">one tick = 30 sim steps; a rejected configuration is pulled back towards the last good state, and abandoned after 5 s</text>
+    </svg>
+    <figcaption><b>Alive, not beautiful.</b> The monitor cannot tell a good frame from a dull one.
+    It can tell a still field from a moving one and a moving one from a boiling one, which is
+    enough to stop the autopilot from wandering into configurations that do nothing at
+    all.</figcaption>
+  </figure>
+
+  <h3 id="guards">Guards and limits</h3>
+
+  <p>The autopilot and the physics are both fenced in. These limits are the difference between a
+  piece that can be left running for hours and one that collapses after ten minutes:</p>
+
+  <table>
+    <thead><tr><th>Guard</th><th>Value</th><th>Why</th></tr></thead>
+    <tbody>
+      <tr><td>speed cap</td><td class="num">3 texels/step</td>
+        <td>With <code>drag → 1</code> the terminal speed is unbounded. The cap is what drag actually multiplies against.</td></tr>
+      <tr><td>force range</td><td class="num">−0.5 … +0.5</td>
+        <td>Keeps P inside the band and stops a morph from spiking the swarm.</td></tr>
+      <tr><td>force never zero</td><td class="num">≤ 1.0 s</td>
+        <td>Zero force means the particles stop steering and the field goes dead, so in auto mode a glide may only <em>pass through</em> zero. A sign-changing glide holds its magnitude at 0.05 and flips once; a backstop re-asserts after a second.</td></tr>
+      <tr><td>persistence clamp</td><td class="num">0.95 … 0.998</td>
+        <td>Below 0.95 the field decays faster than it is written and nothing accumulates; above 0.998 it never forgets and the trails set solid.</td></tr>
+      <tr><td>drag</td><td class="num">0 … 0.95</td>
+        <td>Negative drag is off by default — it makes the swarm accelerate on every step and is only interesting in small doses.</td></tr>
+      <tr><td>rule slew</td><td class="num">3.0 /s</td>
+        <td>Force-space floats are glided at a bounded rate so a rule morph cannot jump a cohort into a different organism between two steps.</td></tr>
+      <tr><td>parameter slew</td><td class="num">0.7–1.6 /s</td>
+        <td>Per second in encoded space; <code>sensor gain</code> glides slower above 2.0, where it is more sensitive.</td></tr>
+    </tbody>
+  </table>
+
+  <!-- ══════════════════════════════════════════════════════════════════════ -->
+  <h2 id="colour">4 · Colour</h2>
+
+  <p>Colour is per cohort, not per particle, and it moves. The hue of a cohort comes from its
+  index spread by the <b>golden angle</b> — so any number of cohorts lands evenly round the
+  circle and two cohorts never collide on the same colour — plus a little hash so the spread is
+  not mechanical.</p>
+
+  <p>Vividness is deliberately <b>two-tier</b>, and that is the whole of the palette design:</p>
+
+  <table>
+    <thead><tr><th>Tier</th><th>Which cohorts</th><th>Saturation</th><th>Value</th></tr></thead>
+    <tbody>
+      <tr><td>accent</td><td>every other one (0, 2, 4 …)</td><td class="num">0.86</td><td class="num">1.00</td></tr>
+      <tr><td>muted</td><td>the ones between (1, 3, 5 …)</td><td class="num">0.50</td><td class="num">0.88</td></tr>
+    </tbody>
+  </table>
+
+  <p>So a twelve-cohort swarm is six saturated accents over six quiet groups rather than twelve
+  competing neon hues. The muted tier is deliberately <em>not</em> dark: 0.50 saturation keeps it
+  clearly a colour rather than grey, and 0.88 value keeps the darkest channel at 112 of 255, well
+  clear of mud. Raising the muted value further just makes it bright again; lowering the
+  saturation turns it grey.</p>
+
+  <figure>
+    <svg viewBox="0 0 1000 128" role="img" aria-label="Twelve cohort colours: six saturated accents alternating with six muted ones, hue spread by the golden angle.">
+      <rect x="0" y="0" width="74" height="74" fill="#bd991a" stroke="#000" stroke-width="1"/>
+      <text x="37" y="88" class="mid tiny">0</text>
+      <text x="37" y="100" class="mid tiny m">accent</text>
+      <rect x="80" y="0" width="74" height="74" fill="#7c53a6" stroke="#000" stroke-width="1"/>
+      <text x="117" y="88" class="mid tiny">1</text>
+      <text x="117" y="100" class="mid tiny m">muted</text>
+      <rect x="160" y="0" width="74" height="74" fill="#1abd3a" stroke="#000" stroke-width="1"/>
+      <text x="197" y="88" class="mid tiny">2</text>
+      <text x="197" y="100" class="mid tiny m">accent</text>
+      <rect x="240" y="0" width="74" height="74" fill="#a6535b" stroke="#000" stroke-width="1"/>
+      <text x="277" y="88" class="mid tiny">3</text>
+      <text x="277" y="100" class="mid tiny m">muted</text>
+      <rect x="320" y="0" width="74" height="74" fill="#1a59bd" stroke="#000" stroke-width="1"/>
+      <text x="357" y="88" class="mid tiny">4</text>
+      <text x="357" y="100" class="mid tiny m">accent</text>
+      <rect x="400" y="0" width="74" height="74" fill="#8ba653" stroke="#000" stroke-width="1"/>
+      <text x="437" y="88" class="mid tiny">5</text>
+      <text x="437" y="100" class="mid tiny m">muted</text>
+      <rect x="480" y="0" width="74" height="74" fill="#bd1ab8" stroke="#000" stroke-width="1"/>
+      <text x="517" y="88" class="mid tiny">6</text>
+      <text x="517" y="100" class="mid tiny m">accent</text>
+      <rect x="560" y="0" width="74" height="74" fill="#53a690" stroke="#000" stroke-width="1"/>
+      <text x="597" y="88" class="mid tiny">7</text>
+      <text x="597" y="100" class="mid tiny m">muted</text>
+      <rect x="640" y="0" width="74" height="74" fill="#bd631a" stroke="#000" stroke-width="1"/>
+      <text x="677" y="88" class="mid tiny">8</text>
+      <text x="677" y="100" class="mid tiny m">accent</text>
+      <rect x="720" y="0" width="74" height="74" fill="#6053a6" stroke="#000" stroke-width="1"/>
+      <text x="757" y="88" class="mid tiny">9</text>
+      <text x="757" y="100" class="mid tiny m">muted</text>
+      <rect x="800" y="0" width="74" height="74" fill="#31bd1a" stroke="#000" stroke-width="1"/>
+      <text x="837" y="88" class="mid tiny">10</text>
+      <text x="837" y="100" class="mid tiny m">accent</text>
+      <rect x="880" y="0" width="74" height="74" fill="#a65377" stroke="#000" stroke-width="1"/>
+      <text x="917" y="88" class="mid tiny">11</text>
+      <text x="917" y="100" class="mid tiny m">muted</text>
+      <text x="0" y="118" class="tiny m">the twelve cohort hues at the default brightness — alternating accent and muted, spread evenly by the golden angle so no two collide</text>
+    </svg>
+    <figcaption><b>The palette.</b> Half the cohorts are accents at saturation 0.86; the
+    cohorts between them are muted at 0.50 with the value lifted to 0.88 so they never go dark or
+    muddy. Collapse this to twelve equal saturated hues and the image turns to neon; the two-tier
+    split is what keeps it a palette.</figcaption>
+  </figure>
+
+  <p>Two further rules keep the colour coherent over time:</p>
+
+  <ul>
+    <li>Every particle in a cohort is exactly the same hue, always. Particles change colour over
+    time because their cohort's hue moves — not because they drift apart.</li>
+    <li>The wobble is per cohort <em>by phase</em>, not per particle. An earlier per-particle
+    version of this spread the hues inside each cohort and produced colour speckle; here a
+    particle can never leave its cohort's hue by more than the wobble amplitude.</li>
+  </ul>
+
+  <p>All cohorts drift round the palette at <b>one shared rate</b>, so their relationships are
+  fixed and cannot desynchronise. The clock is the simulation step count, so colour is
+  reproducible from the seed and freezes when the piece is paused.</p>
+
+  <!-- ══════════════════════════════════════════════════════════════════════ -->
+  <h2 id="settings">5 · Settings reference</h2>
+
+  <p>Every control in the panel. Ranges are the ones enforced by the slider and by the code
+  underneath it; "auto" marks the parameters the autopilot glides when they are not locked.</p>
+
+  <h3 id="s-autopilot">Autopilot</h3>
+  <table>
+    <thead><tr><th>Control</th><th>Range</th><th>What it does</th></tr></thead>
+    <tbody>
+      <tr><td><b>autopilot</b></td><td class="num">on / off</td>
+        <td>Master switch. Off leaves the swarm on its current settings and the panel entirely manual.</td></tr>
+      <tr><td><b>clear locks</b></td><td class="num">—</td>
+        <td>Releases every locked slider back to the autopilot. Dragging any slider locks it, and clicking its label toggles the lock.</td></tr>
+      <tr><td><b>morph time</b></td><td class="num">5 … 180 s</td>
+        <td>How long a glide takes. Longer is smoother and shows the transition as part of the work; shorter makes it a cut. Bounded below by the slew limits, so 5 s and 20 s can look the same on a big jump.</td></tr>
+      <tr><td><b>hold time</b></td><td class="num">5 … 120 s</td>
+        <td>How long each state is left alone before the next move. This is the pacing of the piece, and it is also how long the field gets to form structure.</td></tr>
+      <tr><td><b>exploration</b></td><td class="num">0 … 1</td>
+        <td>Probability that the next destination is generated rather than a known anchor. 0 = always safe and familiar, 1 = always invented. Interactions below.</td></tr>
+      <tr><td><b>seed</b></td><td class="num">integer</td>
+        <td>Seeds the whole show: the order of destinations, the generated candidates, the reset positions. The same seed and the same panel settings replay the same piece.</td></tr>
+    </tbody>
+  </table>
+
+  <h3 id="s-physics">Physics</h3>
+  <table>
+    <thead><tr><th>Control</th><th>Range</th><th>What it does</th><th>Auto</th></tr></thead>
+    <tbody>
+      <tr><td><b>sensor angle</b></td><td class="num">−1 … 1<br>(±180°)</td>
+        <td>How far off the heading the two sensors are swung. Small angles look almost straight ahead: the particle follows the trail it is on and you get long, smooth filaments. Large angles look sideways and the swarm curls into spirals and loops. Near ±90° it is reading across its own path, which is the most unstable regime.</td><td>yes</td></tr>
+      <tr><td><b>sensor dist</b></td><td class="num">−2 … 3.5</td>
+        <td>How far ahead the sensors are placed. Compared to the deposit size this is <a href="#metrics">R</a>: large values make the swarm plan ahead and move in long straight runs, and values near zero make it read its own mark. Negative values put the sensors behind the particle, which makes it reverse into its own trail.</td><td>yes</td></tr>
+      <tr><td><b>sensor gain</b></td><td class="num">0 … 10<br>(clamp 12)</td>
+        <td>Multiplies the two sensor readings before the rule — the swarm's sensitivity. Low gain is sluggish drifting (family A); high gain is a nervous, fast, high-contrast network (family B). This is the single most structural control in the panel and the one the family split is defined by.</td><td>yes</td></tr>
+      <tr><td><b>force</b></td><td class="num">−0.5 … 0.5</td>
+        <td>Global multiplier on the force the rule returns. Sign flips the swarm's handedness. Together with gain it sets <code>P</code>, and it is bounded because P is what keeps a state inside the good band.</td><td>yes</td></tr>
+      <tr><td><b>drag</b></td><td class="num">0 … 0.95</td>
+        <td>Velocity retained per step. Near 0 the particle forgets where it was going and the field is pure reaction; near 1 velocity accumulates and the swarm streams. Terminal speed goes as <code>1 ÷ (1 − drag)</code>, which is why drag and force are felt together and why the speed cap exists.</td><td>yes</td></tr>
+      <tr><td><b>mutation</b></td><td class="num">0 … 1</td>
+        <td>How far each cohort's rule is mutated from the base rule. At 0 all twelve cohorts are one organism; raised, they diverge into competing variants — which is what produces the layered, multi-hued texture. Too high and the rule stops being a behaviour.</td><td>yes</td></tr>
+      <tr><td><b>hazard</b></td><td class="num">0 … 0.05</td>
+        <td>Per-step chance that any single particle is teleported to a random position with zero velocity. A tiny value keeps a few fresh particles seeding new trails in an otherwise settled field; anything larger shreds the structure.</td><td>yes</td></tr>
+      <tr><td><b>persistence</b></td><td class="num">0.95 … 0.998</td>
+        <td>The field's memory — see <a href="#two-memories">Two memories</a>. Higher means the swarm steers by older trails: slower, more coherent, longer filaments. The per-step deposit scales as <code>1 − persistence</code>, so raising it does not simply brighten the field.</td><td>yes</td></tr>
+    </tbody>
+  </table>
+
+  <p class="small muted"><b>Not in the panel, but real physics:</b> <code>axial</code>,
+  <code>lateral</code> and <code>strafe</code> scale the rule's output along and across the
+  heading, and <code>diffusion</code> blurs the trail before it is read. All four are glided by
+  the autopilot and are carried in the copy-state link, but they have no slider in this build.</p>
+
+  <h3 id="s-world">Organism and world</h3>
+  <table>
+    <thead><tr><th>Control</th><th>Range</th><th>What it does</th></tr></thead>
+    <tbody>
+      <tr><td><b>cohorts</b></td><td class="num">1 … 24</td>
+        <td>How many distinct rules share the field. One cohort is a single organism, twelve is a competing population. This is the main lever on visual texture, and it interacts with mutation (how much the cohorts differ).</td></tr>
+      <tr><td><b>world size</b></td><td class="num">tiny … large</td>
+        <td>Scales the whole simulation together: the particle count, the field resolution, and the deposit size. In <code>autopilot.html</code> that is 48 k/150 k/300 k/600 k particles on a 290/512/724/1024-texel field. Lower is smoother and cheaper; higher is denser and finer. In the 4K build this control changes the particle count only — see below.</td></tr>
+    </tbody>
+  </table>
+
+  <h3 id="s-render">Render</h3>
+  <table>
+    <thead><tr><th>Control</th><th>Range</th><th>What it does</th></tr></thead>
+    <tbody>
+      <tr><td><b>brightness</b></td><td class="num">0.2 … 3</td>
+        <td>Multiplies the sprite colour before accumulation. Because accumulation piles frames up, this is the control that keeps a high-accumulation image from blowing out.</td></tr>
+      <tr><td><b>accumulation</b></td><td class="num">0 … 1</td>
+        <td>Long exposure — see <a href="#two-memories">Two memories</a>. 0 = live frame only, 1 = nothing is ever cleared.</td></tr>
+      <tr><td><b>hue drift</b></td><td class="num">0 … 0.01<br>cycles/s</td>
+        <td>How fast the palette as a whole travels. Shared by every cohort, so the swarm's colour relationships are constant and impossible to desynchronise.</td></tr>
+      <tr><td><b>hue wobble</b></td><td class="num">0 … 0.05</td>
+        <td>How far each cohort breathes around its own hue, on its own phase. 0 gives crisp single-hue cohorts; the maximum gives a slow, soft shimmer between them.</td></tr>
+      <tr><td><b>particle size</b></td><td class="num">soft, 1 … 4 px</td>
+        <td>Sprite extent in field texels. <b>soft</b> is the original gaussian dot (1.152 texels across). <b>1 px</b> is one field texel snapped to the texel grid, which is exact and never flickers; larger values are soft dots of that nominal size. Size is in texels, not on screen, so it appears to shrink as the field resolution rises.</td></tr>
+    </tbody>
+  </table>
+
+  <h3 id="s-buttons">Buttons and keys</h3>
+  <table>
+    <thead><tr><th>Control</th><th>Key</th><th>What it does</th></tr></thead>
+    <tbody>
+      <tr><td><b>pause</b></td><td><kbd>space</kbd></td><td>Stops stepping. The accumulated image is not advanced while paused, so the exposure stops too.</td></tr>
+      <tr><td><b>reset</b></td><td><kbd>r</kbd></td><td>Re-scatters the particles on a ring and clears the field and the accumulation.</td></tr>
+      <tr><td><b>new</b></td><td><kbd>n</kbd></td><td>A brand-new organism: a fresh random rule and seed, then a reset.</td></tr>
+      <tr><td><b>mutate</b></td><td><kbd>m</kbd></td><td>A gentle nudge of the current rule, glided through the same slewing path the autopilot uses rather than jumped.</td></tr>
+      <tr><td><b>view</b></td><td><kbd>f</kbd></td><td>Switches between the particles and the field view — the field view paints the trail field's own velocities as colour, which is the only thing that reads the paint layer.</td></tr>
+      <tr><td><b>panel / hud</b></td><td><kbd>h</kbd></td><td>Shows or hides the panel and the status line. The page starts hidden: press <kbd>h</kbd> to see anything.</td></tr>
+    </tbody>
+  </table>
+
+  <!-- ══════════════════════════════════════════════════════════════════════ -->
+  <h2 id="interactions">6 · How the settings interact</h2>
+
+  <p>Almost every control in the panel is really a pair. These are the couplings that matter,
+  in rough order of how often they surprise people.</p>
+
+  <table>
+    <thead><tr><th>Pair</th><th>Coupling</th></tr></thead>
+    <tbody>
+      <tr><td><b>sensor gain × force</b></td>
+        <td>Both multiply the two sensor readings into the same force, so they are the same
+        control twice: <code>P = gain × |force| ÷ (1 − drag)</code>. Raising one and lowering the
+        other keeps the drive but changes the <em>character</em>: gain shapes how strongly the
+        rule responds, force scales what the rule returned.</td></tr>
+
+      <tr><td><b>drag × force</b></td>
+        <td>Drag is a divisor on speed. At <code>drag 0.7</code> the terminal speed is
+        <code>force ÷ 0.3</code>; at <code>0.9</code> it is <code>force ÷ 0.1</code>. The last
+        tenth of the drag slider is worth more than the whole first half, and the speed cap
+        (3 texels/step) is what eventually stops it mattering.</td></tr>
+
+      <tr><td><b>sensor dist × deposit size</b></td>
+        <td>The deposit is fixed at σ 0.163 texels. Sensing closer than about one deposit radius
+        (<code>R &lt; 1</code>) means reading your own trail, which is the standard way to make a
+        configuration die. Filtering the anchors by <code>R</code> is what the good band's
+        <code>Rmin</code> is for.</td></tr>
+
+      <tr><td><b>persistence × sensor gain</b></td>
+        <td>A longer field memory means stronger, longer-lived trails, so the swarm is
+        effectively more sensitive at the same gain. Raising persistence is a rough substitute
+        for raising gain — with the difference that it also slows everything down and smooths
+        it. The deposit is scaled by <code>1 − persistence</code>, which cancels the first-order
+        brightness effect but not the steering coupling.</td></tr>
+
+      <tr><td><b>persistence × accumulation</b></td>
+        <td>Different memories. Persistence changes what the swarm <em>does</em>; accumulation
+        changes what you <em>see</em> it did. If a change to persistence does not look like much,
+        it may be because accumulation is smearing over it.</td></tr>
+
+      <tr><td><b>accumulation × brightness</b></td>
+        <td>Kept frames pile up, so displayed brightness approaches
+        <code>value ÷ (1 − accumulation)</code>. High accumulation and high brightness is the
+        classic blow-out; the intended pairing is more exposure, less brightness.</td></tr>
+
+      <tr><td><b>hazard × everything</b></td>
+        <td>A hazard respawn is a hard reset of that particle — position and velocity both gone.
+        Small values seed new trails inside a settled field; larger values erase the coherence
+        the other controls are building and read as noise.</td></tr>
+
+      <tr><td><b>cohorts × mutation</b></td>
+        <td>Cohorts set <em>how many</em> rules, mutation sets <em>how different</em>. One cohort
+        makes mutation irrelevant. Twelve cohorts at mutation 0 are twelve identical organisms
+        (visually one). Twelve at high mutation are twelve behaviours competing for the same
+        field.</td></tr>
+
+      <tr><td><b>mutation × seed</b></td>
+        <td>Cohort rules are seeded with <code>seed + cohort index</code>, so changing the seed
+        changes the whole population's variation, not just the destination order. Two runs at the
+        same settings and different seeds are the same piece on a different cast.</td></tr>
+
+      <tr><td><b>world size × particle size</b></td>
+        <td>Particle size is in field texels and the field grows with world size, so the same
+        setting looks smaller on a bigger world. In <code>autopilot.html</code>, raising world
+        size also raises the field resolution and therefore the deposit's texel size relative to
+        the canvas.</td></tr>
+
+      <tr><td><b>exploration × hold time</b></td>
+        <td>Generated candidates are noise-perturbed, so some are duds. A long hold with high
+        exploration is a long wait on a possibly-dead state — which is exactly what the health
+        monitor is there to cut short.</td></tr>
+
+      <tr><td><b>morph time × slew limits</b></td>
+        <td>The slew limits are caps, not targets. On a large jump, a 10 s morph and a 30 s morph
+        can traverse the same path at the same speed because the limiter, not the clock, is
+        deciding.</td></tr>
+
+      <tr><td><b>hold time × health</b></td>
+        <td>A struggling configuration slows the autopilot's clock (up to 6×), which stretches
+        both the hold and the morph. A low hold time does not guarantee a fast pace if the swarm
+        is unhappy.</td></tr>
+
+      <tr><td><b>locks × everything</b></td>
+        <td>Any slider you touch is taken out of the autopilot's control and keeps its value
+        through every morph. This is how you steer the piece by hand while it continues to run
+        itself.</td></tr>
+    </tbody>
+  </table>
+
+  <!-- ══════════════════════════════════════════════════════════════════════ -->
+  <h2 id="interface">7 · The interface</h2>
+
+  <p>The page opens with the panel hidden — the piece is the full window. <kbd>h</kbd> reveals
+  the panel and the status line. The status line reports the seed, the autopilot's current phase
+  and destination, the fizz index, and how many sliders are locked.</p>
+
+  <figure>
+    <img src="media/ui.webp" alt="The browser window with the settings panel open on the right." class="shot">
+    <figcaption><b>The panel.</b> Autopilot, physics, world, and render, in the order the
+    autopilot reads them. A locked slider is highlighted and marked; its label toggles the
+    lock.</figcaption>
+  </figure>
+
+  <!-- ══════════════════════════════════════════════════════════════════════ -->
+  <h2 id="captures">8 · Captures</h2>
+
+  <p>Frames taken from the screen recordings in <code>recordings/</code>, cropped to the artwork
+  rectangle and nothing else — no browser chrome, no panel. Click any frame for the full-size
+  version. The first four sets are the letterboxed build at 1536²; the last is the 4K build
+  full bleed.</p>
+
+  <div class="note warn">
+    <b>Vintage.</b> These captures predate two changes: the cohort palette was still twelve equal
+    saturated hues (it is now six accents over six muted groups — see
+    <a href="#colour">Colour</a>), and the panel was still dark on dark. The frames are kept
+    because they show the range of structures the simulation reaches, not the current palette.
+  </div>
+
+  <h3>Recording 1 — high gain, twelve cohorts</h3>
+  <div class="captures">
+    <figure><img src="media/a1.webp" data-full="media/full/a1.webp" alt="Dense layered filaments in violet, green and magenta."><figcaption>a1 · t+25 s</figcaption></figure>
+    <figure><img src="media/a2.webp" data-full="media/full/a2.webp" alt="Dense layered filaments in violet, green and magenta."><figcaption>a2 · t+400 s</figcaption></figure>
+    <figure><img src="media/a3.webp" data-full="media/full/a3.webp" alt="Dense layered filaments in violet, green and magenta."><figcaption>a3 · t+800 s</figcaption></figure>
+  </div>
+
+  <h3>Recording 2 — long trails</h3>
+  <div class="captures">
+    <figure><img src="media/b1.webp" data-full="media/full/b1.webp" alt="Long looping filaments across a dark field."><figcaption>b1 · t+40 s</figcaption></figure>
+    <figure><img src="media/b2.webp" data-full="media/full/b2.webp" alt="Long looping filaments across a dark field."><figcaption>b2 · t+520 s</figcaption></figure>
+    <figure><img src="media/b3.webp" data-full="media/full/b3.webp" alt="Long looping filaments across a dark field."><figcaption>b3 · t+1000 s</figcaption></figure>
+  </div>
+
+  <h3>Recording 3 — organic branch</h3>
+  <div class="captures">
+    <figure><img src="media/c1.webp" data-full="media/full/c1.webp" alt="Branching, cell-like structures of coloured filaments."><figcaption>c1 · t+40 s</figcaption></figure>
+    <figure><img src="media/c2.webp" data-full="media/full/c2.webp" alt="Branching, cell-like structures of coloured filaments."><figcaption>c2 · t+700 s</figcaption></figure>
+    <figure><img src="media/c3.webp" data-full="media/full/c3.webp" alt="Branching, cell-like structures of coloured filaments."><figcaption>c3 · t+1400 s</figcaption></figure>
+  </div>
+
+  <h3>Recording 4 — settled and dense</h3>
+  <div class="captures">
+    <figure><img src="media/d1.webp" data-full="media/full/d1.webp" alt="A dense field of fine multi-coloured grain with a few bold streams."><figcaption>d1 · t+40 s</figcaption></figure>
+    <figure><img src="media/d2.webp" data-full="media/full/d2.webp" alt="A dense field of fine multi-coloured grain with a few bold streams."><figcaption>d2 · t+500 s</figcaption></figure>
+    <figure><img src="media/d3.webp" data-full="media/full/d3.webp" alt="A dense field of fine multi-coloured grain with a few bold streams."><figcaption>d3 · t+1000 s</figcaption></figure>
+  </div>
+
+  <h3>Recording 5 — the 4K build, full bleed</h3>
+  <div class="captures wide">
+    <figure><img src="media/e1.webp" data-full="media/full/e1.webp" alt="Full-screen filaments of green, violet and magenta looping across a dark field."><figcaption>e1 · t+30 s</figcaption></figure>
+    <figure><img src="media/e2.webp" data-full="media/full/e2.webp" alt="Full-screen filaments of green, violet and magenta looping across a dark field."><figcaption>e2 · t+300 s</figcaption></figure>
+    <figure><img src="media/e3.webp" data-full="media/full/e3.webp" alt="Full-screen filaments of green, violet and magenta looping across a dark field."><figcaption>e3 · t+600 s</figcaption></figure>
+  </div>
+
+  <!-- ══════════════════════════════════════════════════════════════════════ -->
+  <h2 id="perf">9 · Performance and the 4K build</h2>
+
+  <p>The cost of this simulation is the <b>field</b>, not the particles. The field is the size of
+  the output canvas, and every field pass touches all of it: at 3840 × 2160 each field-sized
+  RGBA32F texture is 127 MB, and the trail pass reads six texels and writes one for every one of
+  its 8.3 million texels. A million single-pixel sprites, by comparison, are almost free.</p>
+
+  <p>That is why the 4K build's world-size control is a density knob rather than a resolution
+  knob: the field stays at 2160p so the output stays a crisp 1:1, and only the particle count
+  moves (0.5M / 1M / 2M). Because a fixed field with more particles would otherwise be written
+  harder, the deposit is scaled by the particle count so all three settings sit at the strength
+  the configurations were tuned at.</p>
+
+  <table>
+    <thead><tr><th>Setting</th><th>autopilot.html</th><th>autopilot-4k.html</th></tr></thead>
+    <tbody>
+      <tr><td>field height at world size 1</td><td class="num">1024</td><td class="num">2160</td></tr>
+      <tr><td>particles at world size 1</td><td class="num">600 000</td><td class="num">1 000 000</td></tr>
+      <tr><td>framing</td><td>square, letterboxed</td><td>fills the window (16:9 field)</td></tr>
+      <tr><td>world size control</td><td>particles + resolution together</td><td>particles only: 0.5M / 1M / 2M</td></tr>
+      <tr><td>particle size</td><td>soft gaussian, 1.152 texels</td><td>1 hard texel, grid-snapped</td></tr>
+      <tr><td>deposit</td><td>proportional to particle count</td><td>normalised, so settings look alike</td></tr>
+      <tr><td>texture memory</td><td class="num">≈ 150 MB</td><td class="num">≈ 1.0 GB</td></tr>
+    </tbody>
+  </table>
+
+  <div class="note ok">
+    <b>By design.</b> The two files differ by seven constants at the top of the script and
+    nothing else — the header of <code>autopilot-4k.html</code> lists them. Every feature in this
+    document, including the autopilot and the good band, is identical in both.
+  </div>
+
+  <h4>Where the remaining cost is</h4>
+  <ul>
+    <li><b>Full bleed is itself the biggest expense.</b> A 16:9 field has 1.78× the texels of a
+    square field of the same height, so the 4K build pays that for the framing alone.</li>
+    <li><b>An unused field pass was already removed</b> in this version: the paint layer, which
+    only the field view reads, is no longer updated while the particle view is showing.</li>
+    <li><b>The health readback is asynchronous</b> — two pixel buffers, ping-ponged — so nothing
+    in the frame loop waits on the GPU. Health data is one tick behind, which nothing here
+    minds.</li>
+    <li><b>One further lever exists and is off.</b> <code>FIELD_FMT_HALF</code> stores the field
+    in 16-bit floats, halving that traffic at ~0.05 % numeric precision. It is off because it
+    rounds the simulation's own state: the piece stays fine but is subtly different, not merely
+    faster.</li>
+  </ul>
+
+  <!-- ══════════════════════════════════════════════════════════════════════ -->
+  <h2 id="appendix">10 · Appendix: constants</h2>
+
+  <p>The fixed numbers the whole thing is tuned against. These are not in the panel because
+  changing them invalidates the good band.</p>
+
+  <table>
+    <thead><tr><th>Constant</th><th>Value</th><th>Meaning</th></tr></thead>
+    <tbody>
+      <tr><td><code>FIXED_STEPS</code></td><td class="num">2</td><td>simulation steps per displayed frame</td></tr>
+      <tr><td><code>DEPOSIT_SIGMA</code></td><td class="num">0.163</td><td>the deposit's gaussian sigma, in field texels; the unit R is measured in</td></tr>
+      <tr><td><code>SPEED_CAP_TEXELS</code></td><td class="num">3.0</td><td>hard limit on distance moved per step</td></tr>
+      <tr><td><code>FORCE_MAX</code></td><td class="num">0.5</td><td>force is confined to ±0.5</td></tr>
+      <tr><td><code>FORCE_ZERO</code> / <code>_MAX_SEC</code></td><td class="num">0.02 / 1.0 s</td><td>the dead zone, and the longest a glide may linger in it</td></tr>
+      <tr><td><code>PERS_MIN</code> / <code>_MAX</code></td><td class="num">0.95 / 0.998</td><td>field persistence clamp</td></tr>
+      <tr><td><code>DRAG_MAX</code></td><td class="num">0.95</td><td>drag clamp</td></tr>
+      <tr><td><code>RULE_SLEW_PER_SEC</code></td><td class="num">3.0</td><td>how fast rule floats may glide</td></tr>
+      <tr><td><code>HEALTH_N</code></td><td class="num">32</td><td>side of the health readback grid (every 30 steps)</td></tr>
+      <tr><td><code>family threshold</code></td><td class="num">2.2</td><td>sensor gain below this is family A</td></tr>
+      <tr><td><code>band padding</code></td><td class="num">15 %</td><td>how far the good band is widened around the anchors</td></tr>
+    </tbody>
+  </table>
+
+  <footer>
+    <p>hypercells · documentation generated from <code>autopilot.html</code> and
+    <code>autopilot-4k.html</code> · captures cropped from <code>recordings/</code>.</p>
+  </footer>
+
+  </main>
+</div>
+
+<script>
+  // Click a capture to open the full-size version.
+  (function () {
+    var dlg = document.createElement('dialog');
+    dlg.className = 'lightbox';
+    var img = document.createElement('img');
+    var btn = document.createElement('button');
+    btn.textContent = 'Close';
+    btn.className = 'close';
+    dlg.appendChild(img); dlg.appendChild(btn);
+    document.body.appendChild(dlg);
+    btn.addEventListener('click', function () { dlg.close(); });
+    dlg.addEventListener('click', function (e) { if (e.target === dlg) dlg.close(); });
+    document.addEventListener('click', function (e) {
+      var t = e.target;
+      if (!t || t.tagName !== 'IMG') return;
+      var src = t.getAttribute('data-full') || t.getAttribute('src');
+      img.src = src;
+      img.alt = t.getAttribute('alt') || '';
+      dlg.showModal();
+    });
+  })();
+</script>
+</body>
+</html>
