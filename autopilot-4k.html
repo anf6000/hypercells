@@ -32,6 +32,19 @@ and a window smaller than the field gets it fitted (filtered) rather than croppe
 control is a density knob here: the camera, the field and the framing never change, so 2M is a
 safe setting to try mid-show, at 2M sprites per frame.
 
+Performance notes for this build (the particle count is not the main cost -- the FIELD is):
+  - The field is 3840x2160 = 8.3M texels, and every field-sized pass is 133 MB in RGBA32F. The
+    canvas layer alone reads 6 texels and writes 1 per texel, twice per frame.
+  - The paint layer (only ever read by the field view) is no longer updated while the particle
+    view is showing, which removes one of the two full-field passes per step.
+  - The health readback is asynchronous (PBO ping-pong), so nothing in the frame loop waits on
+    the GPU.
+  - The next lever, if you want more, is FIELD_FMT_HALF above: it puts the field in RGBA16F and
+    halves that traffic. It is off because it also rounds the sim's own state (~0.05% relative
+    precision) -- the show stays fine but is subtly different, not merely faster.
+  - Fullscreen costs: a 16:9 field has 1.78x the texels of the square field of the same height,
+    so the full-bleed framing is itself the largest single expense.
+
 Memory is dominated by the field, not the particles: the full-resolution RGBA32F targets (canvas
 x2, paint x2, brush, scene, accum x2) are ~133 MB each at 3840x2160, so budget ~1.1 GB of texture
 memory at any particle count, plus 32 MB per million particles for the entity textures.
@@ -62,42 +75,60 @@ Differences from simple.html (see plan hypercells-autopilot-standalone):
    white-out at high accumulation.
 -->
 <style>
-  :root { --accent:#7ee7ff; --panel:rgba(13,16,20,.78); --line:rgba(255,255,255,.09); --warn:#ffd479; }
+  /* Panel: white, black text, #0000ff accents. No transparency, no rounded corners, no shadows —
+     the same flat language as the documentation site. */
+  :root { --panel:#ffffff; --ink:#000000; --line:#000000; --accent:#0000ff; --quiet:#f2f2f2; --muted:#767676; }
+  * { border-radius:0 !important; box-shadow:none !important; }
   html,body { margin:0; height:100%; overflow:hidden; background:#000; }
   canvas#c { position:fixed; inset:0; width:100vw; height:100vh; display:block; }
   #panel { position:fixed; top:14px; right:14px; width:308px; max-height:calc(100vh - 28px);
-    overflow-y:auto; background:var(--panel); backdrop-filter:blur(14px); -webkit-backdrop-filter:blur(14px);
-    border:1px solid var(--line); border-radius:12px; padding:12px 14px 10px; color:#cfd8dc;
-    font:12px/1.45 ui-monospace,Consolas,monospace; user-select:none; box-shadow:0 10px 40px rgba(0,0,0,.5); }
+    overflow-y:auto; background:var(--panel); border:1px solid var(--line);
+    padding:12px 14px 10px; color:var(--ink);
+    font:12px/1.45 ui-monospace,Consolas,monospace; user-select:none; }
   #panel.hidden { display:none; }
-  #panel::-webkit-scrollbar { width:8px; } #panel::-webkit-scrollbar-thumb { background:#2a3138; border-radius:4px; }
-  .title { font-size:13px; color:#fff; letter-spacing:.4px; display:flex; justify-content:space-between; align-items:center; }
+  #panel::-webkit-scrollbar { width:8px; }
+  #panel::-webkit-scrollbar-track { background:var(--quiet); }
+  #panel::-webkit-scrollbar-thumb { background:var(--ink); }
+  .title { font-size:13px; color:var(--ink); letter-spacing:.4px; display:flex; justify-content:space-between; align-items:center; }
   .title a { color:var(--accent); text-decoration:none; font-size:10px; }
   .sec { margin-top:10px; border-top:1px solid var(--line); padding-top:8px; }
-  .sec>h4 { margin:0 0 6px; font-size:10px; letter-spacing:1.2px; text-transform:uppercase; color:#8a939b; font-weight:600; }
+  .sec>h4 { margin:0 0 6px; font-size:10px; letter-spacing:1.2px; text-transform:uppercase; color:var(--ink); font-weight:700; }
   .row { display:grid; grid-template-columns: 92px 1fr 52px; gap:8px; align-items:center; margin:3px 0; }
-  .row label { color:#aeb6bd; font-size:11px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; cursor:pointer; }
-  .row.locked label { color:var(--warn); }
-  .row.locked label::after { content:" \1F512"; font-size:9px; }
-  .row output { text-align:right; color:#eff3f5; font-size:11px; font-variant-numeric:tabular-nums; }
-  input[type=range] { width:100%; height:14px; margin:0; accent-color:var(--accent); background:transparent; }
-  input[type=text] { background:#161a1f; color:#dfe5e8; border:1px solid var(--line); border-radius:6px;
+  .row label { color:var(--ink); font-size:11px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; cursor:pointer; }
+  .row.locked label { color:var(--accent); }
+  .row.locked label::after { content:" [L]"; font-size:9px; }
+  .row output { text-align:right; color:var(--ink); font-size:11px; font-variant-numeric:tabular-nums; }
+  /* Sliders: a 3 px track with a 9 px square knob, drawn by hand so both stay thin in every
+     browser (the native control is roughly twice this). */
+  input[type=range] { -webkit-appearance:none; appearance:none; width:100%; height:12px; margin:0; background:transparent; }
+  input[type=range]::-webkit-slider-runnable-track { height:3px; background:var(--quiet); border:1px solid var(--line); }
+  input[type=range]::-webkit-slider-thumb { -webkit-appearance:none; width:9px; height:9px; margin-top:-4px;
+    background:var(--accent); border:0; border-radius:0; }
+  input[type=range]::-moz-range-track { height:3px; background:var(--quiet); border:1px solid var(--line); }
+  input[type=range]::-moz-range-thumb { width:9px; height:9px; background:var(--accent); border:0; border-radius:0; }
+  input[type=text] { background:var(--panel); color:var(--ink); border:1px solid var(--line);
     padding:3px 6px; font:11px ui-monospace,monospace; width:100%; }
-  select { background:#161a1f; color:#dfe5e8; border:1px solid var(--line); border-radius:6px; padding:3px 6px; font:11px ui-monospace,monospace; width:100%; }
+  select { background:var(--panel); color:var(--ink); border:1px solid var(--line); padding:3px 6px;
+    font:11px ui-monospace,monospace; width:100%; }
   .btns { display:grid; grid-template-columns:repeat(3,1fr); gap:6px; margin-top:8px; }
   .btns.two { grid-template-columns:1fr 1fr; }
-  button { background:#1b2026; color:#dfe5e8; border:1px solid var(--line); border-radius:7px; padding:6px 4px;
+  button { background:var(--panel); color:var(--ink); border:1px solid var(--line); padding:6px 4px;
     font:11px ui-monospace,monospace; cursor:pointer; }
-  button:hover { border-color:var(--accent); color:#fff; }
-  button.on { background:#123742; border-color:var(--accent); color:var(--accent); }
-  .apinfo { margin-top:6px; color:#8fa0ab; font-size:10px; line-height:1.5; }
-  .apinfo b { color:#dfe5e8; font-weight:600; }
-  .hint { margin-top:10px; color:#5d666e; font-size:10px; line-height:1.6; border-top:1px solid var(--line); padding-top:6px; }
-  .hint b { color:#9aa3ab; font-weight:600; }
-  #hud { position:fixed; left:14px; bottom:12px; color:#7d868e; font:11px ui-monospace,monospace; user-select:none; }
+  button:hover { background:var(--quiet); }
+  button.on { background:var(--accent); border-color:var(--accent); color:var(--panel); }
+  .apinfo { margin-top:6px; color:var(--ink); font-size:10px; line-height:1.5; }
+  .apinfo b { color:var(--ink); font-weight:700; }
+  .hint { margin-top:10px; color:var(--muted); font-size:10px; line-height:1.6; border-top:1px solid var(--line); padding-top:6px; }
+  .hint b { color:var(--ink); font-weight:700; }
+  #hud { position:fixed; left:14px; bottom:12px; background:var(--panel); color:var(--ink);
+    border:1px solid var(--line); padding:2px 6px; font:11px ui-monospace,monospace; user-select:none; }
   #hud.hidden { display:none; }
-  #err { position:fixed; inset:0; margin:auto; width:min(720px,90vw); height:max-content; background:#1a1113; color:#ffb4b4;
-    padding:24px; border:1px solid #5a2a2a; border-radius:12px; font:12px ui-monospace,monospace; white-space:pre-wrap; display:none; z-index:10; }
+  #err { position:fixed; inset:0; margin:auto; width:min(720px,90vw); height:max-content; background:var(--panel);
+    color:var(--ink); border:1px solid var(--line); border-left:6px solid var(--accent);
+    padding:24px; font:12px ui-monospace,monospace; white-space:pre-wrap; display:none; z-index:10; }
+  #evoStatus { margin-top:6px; font-size:10px; line-height:1.5; white-space:pre-wrap; word-break:break-word; color:var(--ink); }
+  button:disabled { color:var(--muted); cursor:default; background:var(--quiet); }
+  select:disabled { color:var(--muted); }
 </style>
 </head>
 <body>
@@ -119,8 +150,15 @@ Differences from simple.html (see plan hypercells-autopilot-standalone):
     <div class="apinfo" id="apinfo"></div>
   </div>
 
-  <div class="sec"><h4>Physics</h4><div id="secPhysics"></div></div>
+  <div class="sec"><h4>Evolve</h4>
+    <div class="btns two"><button id="bEvolve">evolve: bridge offline</button><button id="bEvoNow">evolve now</button></div>
+    <div class="btns two"><button id="bEvoShader">shader edits: on</button></div>
+    <div class="row"><label>interval</label><input type="range" id="sEvoInt" min="1" max="15" step="1" value="3"><output id="oEvoInt">3m</output></div>
+    <div class="row"><label>version</label><select id="selEvoVersion" style="grid-column:2/4"></select></div>
+    <div id="evoStatus"></div>
+  </div>
 
+  <div class="sec"><h4>Physics</h4><div id="secPhysics"></div></div>
   <div class="sec"><h4>Organism &amp; world</h4>
     <div class="row"><label>cohorts</label><input type="range" id="sCohorts" min="1" max="24" step="1"><output id="oCohorts"></output></div>
     <div class="row"><label>world size</label><select id="selQuality" style="grid-column:2/4"></select></div>
@@ -128,10 +166,7 @@ Differences from simple.html (see plan hypercells-autopilot-standalone):
 
   <div class="sec"><h4>Render</h4><div id="secRender"></div></div>
 
-  <div class="btns"><button id="bShare" style="grid-column:1/4">copy state link</button></div>
-  <div class="btns two"><button id="bSave">save current</button><button id="bExport">export good finds</button></div>
-
-  <div class="hint"><b>space</b> pause &nbsp;&middot;&nbsp; <b>r</b> reset &nbsp;&middot;&nbsp; <b>n</b> new organism &nbsp;&middot;&nbsp; <b>m</b> mutate (smooth) &nbsp;&middot;&nbsp;
+  <div class="hint"><b>space</b> pause &nbsp;&middot;&nbsp; <b>r</b> reset &nbsp;&middot;&nbsp; <b>n</b> new organism &nbsp;&middot;&nbsp; <b>m</b> mutate &nbsp;&middot;&nbsp;
   <b>f</b> field view &nbsp;&middot;&nbsp; <b>h</b> show/hide this panel.<br>
   Click a physics label to lock/unlock it against the autopilot; dragging a slider locks it automatically.</div>
 </div>
@@ -197,7 +232,7 @@ void main(){ uv = in_position * 0.5 + 0.5; gl_Position = vec4(in_position, 0.0, 
 // Entity physics. The per-cohort rule comes from a texture (texelFetch); the
 // in-shader mutate_rule / generate_random_centers / zero-rule fallback are gone.
 // ---------------------------------------------------------------------------
-const ENTITY_FS = `#version 300 es
+const ENTITY_HEAD = `#version 300 es
 precision highp float;
 precision highp int;
 
@@ -289,7 +324,11 @@ vec4 do_reset(int index, int mode){
 vec4 black_box(vec2 L, vec2 R, Rule rule){ return fourier_noise(rule.centers, vec4(L, R)); }
 vec2 y_reflect(vec2 p){ return p * vec2(1.0, -1.0); }
 
-void calculate_entity_behavior(vec2 L, vec2 R, vec2 axis, Rule rule, out vec2 force, out vec2 strafe){
+`;
+
+// The behaviour function is the part the LLM may rewrite; ENTITY_HEAD (helpers) and ENTITY_MAIN
+// stay fixed. buildEntityFS() stitches them back together.
+const BEHAVIOR_V0 = `void behavior(vec2 L, vec2 R, vec2 axis, Rule rule, out vec2 force, out vec2 strafe){
   vec2 forward = safenorm(axis);
   vec2 left = vec2(forward.y, -forward.x);
   L = vec2(dot(L, forward), dot(L, left));
@@ -301,8 +340,9 @@ void calculate_entity_behavior(vec2 L, vec2 R, vec2 axis, Rule rule, out vec2 fo
   // axial/lateral scale the LOCAL frame components (scaling world x/y caused the vertical bias)
   force  = forward * (force.x  * config_c.y) + left * (force.y  * config_c.z);
   strafe = forward * (strafe.x * config_c.y) + left * (strafe.y * config_c.z);
-}
+}`;
 
+const ENTITY_MAIN = `
 void main(){
   ivec2 pixel = ivec2(gl_FragCoord.xy);
   int index = pixel.y * entity_tex_width + pixel.x;
@@ -329,7 +369,7 @@ void main(){
   rtap *= sensor_scaling;
 
   vec2 strafe = vec2(0.0), force = vec2(0.0);
-  calculate_entity_behavior(ltap.xy, rtap.xy, orientation, rule, force, strafe);
+  __BEHAVE__
   force *= 1.0 / sqrt_world_size * config_b.z / 400.0;
   strafe *= 1.0 / sqrt_world_size * config_b.z / 20.0;
 
@@ -387,11 +427,7 @@ void main(){
 const CANVAS_FS = `#version 300 es
 precision highp float;
 uniform vec2 persistence_diffusion; // trail_persistence, trail_diffusion
-uniform float paint_gain;           // additive deposit rate (paint mode)
-uniform vec4 trail_draw_mouse;      // cur.xy, prev.xy in canvas uv space
-uniform float trail_draw_radius;
-uniform float trail_draw_power;
-uniform vec2 canvas_resolution;
+uniform float paint_gain;           // additive deposit rate
 uniform sampler2D brush_texture;
 uniform sampler2D canvas_texture;
 uniform int frame_count;
@@ -404,7 +440,6 @@ vec4 getBlur(vec2 pos, sampler2D sam, float K){
   vec4 wc = getCan(pos - off.xz, sam); vec4 ec = getCan(pos + off.xz, sam);
   return (getCan(pos, sam) * K + nc + sc + wc + ec) / (4.0 + K);
 }
-float draw_kernel(float distance, float sigma){ return exp(-distance * distance / (2.0 * sigma * sigma)); }
 void main(){
   if (frame_count < 2){ canvas_out = vec4(0.0, 0.0, 0.0, 1.0); return; }
   float p = persistence_diffusion.x, d = persistence_diffusion.y;
@@ -416,14 +451,6 @@ void main(){
     canvas_color = getBlur(uv, canvas_texture, K);
   } else canvas_color = texture(canvas_texture, uv);
   canvas_out = canvas_color * p + vec4(brush_color.xy, 0.0, 1.0) * paint_gain;
-  if (trail_draw_power > 0.0 && trail_draw_radius > 0.0){
-    vec2 mouse_vel = trail_draw_mouse.xy - trail_draw_mouse.zw;
-    vec2 delta = uv - trail_draw_mouse.xy;
-    delta.x *= canvas_resolution.x / canvas_resolution.y;
-    float kernel_weight = draw_kernel(length(delta), trail_draw_radius);
-    vec2 draw_vector = mouse_vel * (trail_draw_power / 5.0);
-    canvas_out.xy += draw_vector * kernel_weight / trail_draw_radius;
-  }
   canvas_out.w = 1.0;
 }`;
 
@@ -455,9 +482,8 @@ uniform sampler2D entity_texture;
 uniform int entity_tex_width;
 uniform int entity_count;
 uniform int cohorts;
-uniform float sqrt_world_size;
 uniform vec2 tex_scale;
-uniform vec2 u_field_px;     // field size in texels: sprite size is measured in texels, not texas
+uniform vec2 u_field_px;     // field size in texels: sprite size is measured in texels, not sim units
 uniform float u_sprite_half; // sprite half extent, in field texels
 uniform float u_snap;        // 1: snap the sprite centre to the texel grid (single-pixel sprites)
 uniform float u_hue_time;    // deterministic sim clock in seconds (counts sim steps)
@@ -486,8 +512,19 @@ void main(){
   // phase would spread the hues *inside* a group -- that is the speckle.
   float group_phase = hash_float(uint(cohort_index) * 40503u + 1u);
   float wobble = u_hue_wobble * sin(6.2831853 * (0.0125 * u_hue_time + group_phase));
-  float hue = hash_float(uint(cohort_index) * 2654435761u) + u_hue_drift * u_hue_time + wobble;
-  v_color = vec4(hue, 0.8, 1.0, 1.0);
+  // Hue is spread by the golden angle rather than hashed, so any number of cohorts lands evenly
+  // round the circle and no two ever collide; a little hash keeps it from looking mechanical.
+  //
+  // Vividness is deliberately two-tier. Every other cohort is an ACCENT — saturated. The cohorts
+  // between them are muted but not dark: saturation 0.50 keeps them clearly a colour rather than
+  // grey, and value 0.88 keeps them out of the mud. Twelve equal neon hues compete and the image
+  // goes loud; six accents over six quiet groups reads as a palette. (Measured against the old
+  // all-cohorts-at-0.8/1.0 rule: saturation 56% -> 42%, with the bright tier unchanged.)
+  float hue = fract(0.6180339887 * float(cohort_index) + 0.13)
+            + (hash_float(uint(cohort_index) * 2246822519u) - 0.5) * 0.04
+            + u_hue_drift * u_hue_time + wobble;
+  float accent = mod(float(cohort_index), 2.0) < 0.5 ? 1.0 : 0.0;
+  v_color = vec4(hue, mix(0.50, 0.86, accent), mix(0.88, 1.0, accent), 1.0);
   vec2 uv_coords[4] = vec2[4](vec2(0.0, 0.0), vec2(1.0, 0.0), vec2(1.0, 1.0), vec2(0.0, 1.0));
   vec2 corners[4] = vec2[4](vec2(-1.0, -1.0), vec2(1.0, -1.0), vec2(1.0, 1.0), vec2(-1.0, 1.0));
   // Sprite size is set in FIELD TEXELS, not in sim units, so zooming the field (world size) or
@@ -675,11 +712,16 @@ const FILL_SCREEN = true;        // fills the screen: the field takes the window
                                  // of being stretched across a 16:9 field
 const SCALE_FIELD_WITH_WORLD = false; // world size scales ONLY the particle count (true would scale
                                       // the field resolution too, and the tuned distances with it)
-const PARTICLE_PX = 1;           // one hard field texel per particle, snapped to the texel grid, so
-                                 // every particle is exactly one pixel. 0 gives the original soft
-                                 // sprite, sized as SPRITE_FIELD_FRACTION of the field height
+const PARTICLE_PX = 1;           // default particle size: one field texel. The particle size slider
+                                 // covers 1..4 px plus 0 = the original soft sprite, which is what
+                                 // the other build still defaults to
+const PARTICLE_PX_MAX = 4;       // particle size slider ceiling, in pixels
 const SPRITE_DIM_FRACTION = 0.001125;  // soft sprite diameter as a fraction of CANVAS_DIM, which is
                                        // what makes it 1.152 texels at any world size (the original)
+const FIELD_FMT_HALF = false;    // true: store the field in RGBA16F instead of RGBA32F. Halves the
+                                 // field memory traffic (the dominant cost at 4K) at ~0.05% numeric
+                                 // precision. Off by default: it rounds the sim's own state, so the
+                                 // show is subtly different, not just faster.
 const NORMALISE_DEPOSIT = true;  // scale the deposit by the particle count, so the 0.5M / 1M / 2M
                                  // settings all keep the field strength the configs were tuned at
 const BRUSH_REF_PARTICLES = 600000;      // the count at which the deposit weight is 1
@@ -715,12 +757,12 @@ const NOISE = {
 
 const app = {
   paused: false, view: 'particles', brightness: 0.74,
-  stepsPerFrame: FIXED_STEPS, simWorldSize: 1.0, resetSeed: 1, hardPixels: false,
+  simWorldSize: 1.0, resetSeed: 1, hardPixels: false,
   accum: 0.93, cohorts: 12,
   allowNegativeDrag: false,
   seed: 1, morphTime: 45, holdTime: 25, exploration: 0.35, hueDrift: 0.010, hueWobble: 0.04,
+  particlePx: PARTICLE_PX,
 };
-const mouse = { uv: [0, 0], prev: [0, 0] };
 
 let cfg = null;
 let C = null;
@@ -762,14 +804,21 @@ function computeConstants(){
   const entityTexWidth = Math.ceil(Math.sqrt(entityCount));
   const entityTexHeight = Math.ceil(entityCount / entityTexWidth);
   const brushWeight = NORMALISE_DEPOSIT ? Math.min(1, BRUSH_REF_PARTICLES / Math.max(entityCount, 1)) : 1;
-  return { W, H, tex_scale: texScale, worldSize, sqrtWorldSize, entityCount, canvasWidth, canvasHeight,
+  return { tex_scale: texScale, sqrtWorldSize, entityCount, canvasWidth, canvasHeight,
            entityTexWidth, entityTexHeight, brushWeight };
 }
-function floatTex(w, h, linear){
+// Field textures. FIELD_FMT_HALF swaps RGBA32F for RGBA16F: half the bytes moved per pass, which
+// is the whole cost of the sim at 4K, at ~0.05% relative precision. Entity textures and the
+// health readback target stay 32F: particle positions need the extra bits (16F at ~1.0 has a
+// spacing of ~1e-3, the same size as one step of movement), and readPixels wants a float target.
+function floatTex(w, h, linear, half){
   const t = gl.createTexture();
   gl.bindTexture(gl.TEXTURE_2D, t);
-  gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA32F, w, h, 0, gl.RGBA, gl.FLOAT, null);
-  const filt = linear && floatLinear ? gl.LINEAR : gl.NEAREST;
+  const useHalf = half && FIELD_FMT_HALF;
+  if (useHalf) gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA16F, w, h, 0, gl.RGBA, gl.HALF_FLOAT, null);
+  else gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA32F, w, h, 0, gl.RGBA, gl.FLOAT, null);
+  // 16F is filterable in ES 3.0; 32F needs OES_texture_float_linear
+  const filt = linear && (useHalf || floatLinear) ? gl.LINEAR : gl.NEAREST;
   gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, filt);
   gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, filt);
   gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.REPEAT);
@@ -777,7 +826,7 @@ function floatTex(w, h, linear){
   return t;
 }
 function screenTex(w, h){
-  const t = floatTex(w, h, true);
+  const t = floatTex(w, h, true, true);
   gl.bindTexture(gl.TEXTURE_2D, t);
   gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
   gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
@@ -814,7 +863,7 @@ function makeBrushVAO(){
   return vao;
 }
 function initGL(){
-  progEntity  = makeProgram(QUAD_VS, ENTITY_FS);
+  progEntity  = makeProgram(QUAD_VS, buildEntityFS(BEHAVIOR_V0, null));
   progBrush   = makeProgram(BRUSH_VS, BRUSH_FS);
   progCanvas  = makeProgram(QUAD_VS, CANVAS_FS);
   progField   = makeProgram(QUAD_VS, FIELD_FS);
@@ -824,6 +873,13 @@ function initGL(){
   progReduce  = makeProgram(QUAD_VS, REDUCE_FS);
   quadVAO  = makeQuadVAO();
   brushVAO = makeBrushVAO();
+  // pixel-pack buffers for the non-blocking health readback (32x32 RGBA32F each)
+  for (let i = 0; i < 2; i++){
+    healthPBO[i] = gl.createBuffer();
+    gl.bindBuffer(gl.PIXEL_PACK_BUFFER, healthPBO[i]);
+    gl.bufferData(gl.PIXEL_PACK_BUFFER, HEALTH_N * HEALTH_N * 16, gl.STREAM_READ);
+    gl.bindBuffer(gl.PIXEL_PACK_BUFFER, null);
+  }
 }
 function destroyResources(){
   for (let i = 0; i < 2; i++){
@@ -844,10 +900,10 @@ function createResources(){
   destroyResources();
   C = computeConstants();
   for (let i = 0; i < 2; i++){ entityTex[i] = floatTex(C.entityTexWidth, C.entityTexHeight, false); entityFBO[i] = fboOf(entityTex[i]); }
-  for (let i = 0; i < 2; i++){ canvasTex[i] = floatTex(C.canvasWidth, C.canvasHeight, true); canvasFBO[i] = fboOf(canvasTex[i]); }
-  for (let i = 0; i < 2; i++){ paintTex[i] = floatTex(C.canvasWidth, C.canvasHeight, true); paintFBO[i] = fboOf(paintTex[i]); }
+  for (let i = 0; i < 2; i++){ canvasTex[i] = floatTex(C.canvasWidth, C.canvasHeight, true, true); canvasFBO[i] = fboOf(canvasTex[i]); }
+  for (let i = 0; i < 2; i++){ paintTex[i] = floatTex(C.canvasWidth, C.canvasHeight, true, true); paintFBO[i] = fboOf(paintTex[i]); }
   paintPing = 0;
-  brushTex = floatTex(C.canvasWidth, C.canvasHeight, true);
+  brushTex = floatTex(C.canvasWidth, C.canvasHeight, true, true);
   brushFBO = fboOf(brushTex);
   cohortRulesTex = floatTex(RULE_COLS, RULE_ROWS, false);
   reduceTex = floatTex(HEALTH_N, HEALTH_N, false); reduceFBO = fboOf(reduceTex);
@@ -923,6 +979,7 @@ function updateEntities(){
   u1i(p, 'initial_conditions', cfg.initial_conditions);
   u1f(p, 'u_reset_seed', app.resetSeed);
   u1f(p, 'sqrt_world_size', C.sqrtWorldSize);
+  u1f(p, 'u_blend', evo.blend);
   u1f(p, 'u_max_speed', SPEED_CAP_TEXELS * 2.0 / C.canvasWidth);
   u2f(p, 'tex_scale', C.tex_scale);
   u1i(p, 'frame_count', frameCount);
@@ -950,21 +1007,22 @@ function advance(){
   gl.bindVertexArray(quadVAO);
   bindTex(0, brushTex, p, 'brush_texture');
   u1i(p, 'frame_count', frameCount);
-  u4f(p, 'trail_draw_mouse', [mouse.uv[0], mouse.uv[1], mouse.prev[0], mouse.prev[1]]);
-  u1f(p, 'trail_draw_radius', app.drawRadius);
-  u1f(p, 'trail_draw_power', 0);   // draw mode is fixed off in the autopilot build
-  u2f(p, 'canvas_resolution', [C.canvasWidth, C.canvasHeight]);
   const tp = clamp(cfg.trail_persistence, PERS_MIN, PERS_MAX);
   canvasPing = updateLayer(canvasTex, canvasFBO, canvasPing, tp, 1 - tp);
-  paintPing  = updateLayer(paintTex,  paintFBO,  paintPing,  cfg.paint_persistence, cfg.paint_gain);
+  // The paint layer is only ever read by the field view, so it is not worth a second full-field
+  // pass every step: at 4K that pass alone is ~133 MB of reads and writes per step. It does mean
+  // the field view starts accumulating when you switch to it rather than having been collecting
+  // all along.
+  if (app.view === 'field')
+    paintPing = updateLayer(paintTex, paintFBO, paintPing, cfg.paint_persistence, cfg.paint_gain);
   frameCount++;
 }
-// Sprite half extent in FIELD TEXELS. PARTICLE_PX pins it (1 = a particle is one texel across,
-// and the shader snaps it to the texel grid); otherwise it is the original soft sprite: a fixed
-// fraction of CANVAS_DIM, i.e. 1.152 texels at any world size. Sizing it against the field
-// *height* instead would shrink it to nothing at small world sizes.
+// Sprite half extent in FIELD TEXELS, from the live particle size setting. app.particlePx > 0 pins
+// it (1 = a particle is one texel across, and the shader snaps it to the texel grid); 0 is the
+// original soft sprite: a fixed fraction of CANVAS_DIM, i.e. 1.152 texels at any world size.
+// Sizing that against the field *height* instead would shrink it to nothing at small world sizes.
 function spriteHalfTexels(){
-  return PARTICLE_PX > 0 ? PARTICLE_PX * 0.5 : 0.5 * SPRITE_DIM_FRACTION * CANVAS_DIM;
+  return app.particlePx > 0 ? app.particlePx * 0.5 : 0.5 * SPRITE_DIM_FRACTION * CANVAS_DIM;
 }
 function spritePass(target){
   const p = progSprite;
@@ -976,13 +1034,12 @@ function spritePass(target){
   u1i(p, 'entity_tex_width', C.entityTexWidth);
   u1i(p, 'entity_count', C.entityCount);
   u1i(p, 'cohorts', cfg.cohorts);
-  u1f(p, 'sqrt_world_size', C.sqrtWorldSize);
   u2f(p, 'tex_scale', C.tex_scale);
+  u2f(p, 'u_field_px', [C.canvasWidth, C.canvasHeight]);
   u1f(p, 'brightness', app.brightness);
   u1f(p, 'u_hard', app.hardPixels ? 1 : 0);
-  u2f(p, 'u_field_px', [C.canvasWidth, C.canvasHeight]);
-  u1f(p, 'u_sprite_half', spriteHalfTexels(C));
-  u1f(p, 'u_snap', PARTICLE_PX > 0 ? 1 : 0);
+  u1f(p, 'u_sprite_half', spriteHalfTexels());
+  u1f(p, 'u_snap', app.particlePx > 0 ? 1 : 0);
   u1f(p, 'u_hue_time', simStep * SEC_PER_STEP);
   u1f(p, 'u_hue_drift', app.hueDrift);
   u1f(p, 'u_hue_wobble', app.hueWobble);
@@ -1082,11 +1139,27 @@ function newOrganism(){
   resetSim(rndRange(0, 1000));
 }
 function mutate(){
-  // was a jump; now a smooth seeded nudge of the rule, still through the slew limiter
-  const rule = mutateRuleStable(cfg.rule, 0.15 * (0.5 + cfg.mutation_scale), f32(rndRange(0, 1000)));
+  // A real re-roll of the organism rather than a nudge. Two things made the old version look
+  // inert: the mutation amount was tiny (0.15 x mutation scale, ~0.1) and it glided over the
+  // autopilot's whole morph time (45 s by default). Now it is a large stable mutation applied
+  // over MUTATE_SECONDS, so the change is both bigger and visible as an event.
+  const amount = f32(0.55 + 0.65 * cfg.mutation_scale);
+  const rule = mutateRuleStable(cfg.rule, amount, f32(rndRange(0, 1000)));
   beginMorph({ n: ap.currentName + '\u2192mutated', generated: true, p: currentParams(), rule });
+  ap.morphSteps = stepsOf(Math.min(app.morphTime, MUTATE_SECONDS));
 }
 function setPaused(v){ app.paused = v; $('bPause').textContent = v ? 'resume' : 'pause'; $('bPause').classList.toggle('on', v); }
+function setWorldSize(v){
+  // Guarded: the select can hand back an empty string (no matching option) and a crafted state
+  // link can carry anything, either of which would otherwise make the particle count NaN and
+  // leave the page silently dead.
+  const ws = parseFloat(v);
+  if (!Number.isFinite(ws) || ws <= 0) return false;
+  if (ws === app.simWorldSize) return true;
+  app.simWorldSize = ws;
+  createResources();
+  return true;
+}
 function setView(v){ if (v !== app.view){ app.view = v; clearAccum(); } $('bView').textContent = 'view: ' + v; }
 
 function currentParams(){
@@ -1244,6 +1317,7 @@ const ap = {
 const SEC_PER_STEP = 1 / (60 * FIXED_STEPS);
 const stepsOf = sec => Math.max(1, Math.round(sec * 60 * FIXED_STEPS));
 const RULE_SLEW_PER_SEC = 3.0;
+const MUTATE_SECONDS = 5;     // the mutate button's glide: a short event, not a full morph
 
 function beginMorph(target){
   if (!target) return;
@@ -1320,8 +1394,8 @@ function autopilotStep(){
     ap.phase = 'hold'; ap.holdLeft = stepsOf(app.holdTime); ap.slowFactor = 1;
   }
   if (ap.phase === 'hold'){
-    ap.holdLeft--;
-    if (ap.holdLeft <= 0){
+    if (!evo.trial) ap.holdLeft--;
+    if (ap.holdLeft <= 0 && !evo.trial){
       const tgt = rng() < app.exploration ? generateCandidate() : pickAnchorTarget();
       if (tgt) beginMorph(tgt); else ap.holdLeft = stepsOf(app.holdTime);
     }
@@ -1350,9 +1424,17 @@ function abandonTarget(){
 // ===========================================================================
 // Health monitor
 // ===========================================================================
-const H = { prev: null, buf: new Float32Array(HEALTH_N * HEALTH_N * 4), mean: 0, fizz: 0, ratio: 0, ref: 0,
-            good: true, badSec: 0, goodSec: 0, lastGood: null, saved: new Set() };
+// two pixel-pack buffers, ping-ponged, so the readback never blocks the frame (see reduceAndRead)
+const healthPBO = [null, null];
+let healthPing = 0, healthHaveData = false;
+const H = { prev: null, buf: new Float32Array(HEALTH_N * HEALTH_N * 4), ratio: 0, ref: 0,
+            good: true, badSec: 0, goodSec: 0, lastGood: null };
 
+// The health readback goes through a pair of pixel-pack buffers: readPixels into one is queued
+// without waiting, and the *other* one -- filled a tick ago, so the copy has certainly landed --
+// is read with getBufferSubData. Reading the buffer you just wrote would stall the pipeline
+// waiting for the reduction, which is the one synchronisation point in the frame loop. The cost
+// is that health data is one tick (30 sim steps) old, which nothing here is sensitive to.
 function reduceAndRead(){
   const p = progReduce;
   gl.useProgram(p);
@@ -1361,7 +1443,16 @@ function reduceAndRead(){
   bindTex(0, canvasTex[canvasPing], p, 'src');
   gl.bindVertexArray(quadVAO);
   gl.drawArrays(gl.TRIANGLES, 0, 6);
-  gl.readPixels(0, 0, HEALTH_N, HEALTH_N, gl.RGBA, gl.FLOAT, H.buf);
+  gl.bindBuffer(gl.PIXEL_PACK_BUFFER, healthPBO[healthPing]);
+  gl.readPixels(0, 0, HEALTH_N, HEALTH_N, gl.RGBA, gl.FLOAT, 0);
+  gl.bindBuffer(gl.PIXEL_PACK_BUFFER, null);
+  if (healthHaveData){
+    gl.bindBuffer(gl.PIXEL_PACK_BUFFER, healthPBO[1 - healthPing]);
+    gl.getBufferSubData(gl.PIXEL_PACK_BUFFER, 0, H.buf);
+    gl.bindBuffer(gl.PIXEL_PACK_BUFFER, null);
+  }
+  healthPing = 1 - healthPing;
+  healthHaveData = true;
   gl.bindFramebuffer(gl.FRAMEBUFFER, null);
 }
 function correctivePull(gp){
@@ -1371,15 +1462,6 @@ function correctivePull(gp){
   }
   clampPhysics(cfg);
   ruleDirty = true;
-}
-function saveGoodTarget(){
-  if (!ap.target) return;
-  const sig = sigOf(ap.target.p);
-  if (H.saved.has(sig)) return;
-  H.saved.add(sig);
-  const list = loadGood();
-  list.push({ c: snapshotCfg(), t: Date.now() });
-  try { localStorage.setItem('hypercells.autopilot.good.v1', JSON.stringify(list)); } catch (e) {}
 }
 function healthTick(){
   reduceAndRead();
@@ -1393,24 +1475,23 @@ function healthTick(){
   m /= n2; f /= n2;
   if (!H.prev) H.prev = new Float32Array(n2 * 4);
   H.prev.set(H.buf);
-  H.mean = m; H.fizz = f;
   H.ref = Math.max(H.ref * 0.9995, m, 1e-9);
   H.ratio = f / Math.max(m, 1e-9);
   const dead = m < 0.12 * H.ref;
   const fizzy = H.ratio > 0.55;
+  H.mean = m; H.dead = dead; H.fizzy = fizzy;
   const dtSec = 30 * SEC_PER_STEP;
   if (dead || fizzy){
     H.good = false; H.goodSec = 0; H.badSec += dtSec;
     ap.slowFactor = Math.min(ap.slowFactor * 1.25 + 0.04, 6);
     if (H.lastGood && !dead) correctivePull(H.lastGood.p);
-    if (H.badSec > 5){ abandonTarget(); H.badSec = 0; }
+    if (H.badSec > 5){ evoUnhealthy(); H.badSec = 0; }
   } else {
     H.good = true;
     H.badSec = Math.max(0, H.badSec - dtSec * 0.5);
     H.goodSec += dtSec;
     ap.slowFactor = Math.max(1, ap.slowFactor * 0.97);
     H.lastGood = snapshotParams();
-    if (ap.phase === 'hold' && H.goodSec > 8 && ap.target && ap.target.generated) saveGoodTarget();
   }
 }
 
@@ -1423,10 +1504,12 @@ function setAppSlider(key, v){
   else if (key === '__accum') app.accum = v;
   else if (key === '__hueDrift') app.hueDrift = clamp(v, 0, HUE_DRIFT_MAX);
   else if (key === '__hueWobble') app.hueWobble = clamp(v, 0, HUE_WOBBLE_MAX);
+  else if (key === '__particlePx') app.particlePx = clamp(Math.round(v), 0, PARTICLE_PX_MAX);
 }
 function appVal(key){
   return key === '__brightness' ? app.brightness : key === '__accum' ? app.accum
-       : key === '__hueDrift' ? app.hueDrift : key === '__hueWobble' ? app.hueWobble : cfg[key];
+       : key === '__hueDrift' ? app.hueDrift : key === '__hueWobble' ? app.hueWobble
+       : key === '__particlePx' ? app.particlePx : cfg[key];
 }
 function setConfigKey(key, v){
   cfg[key] = v;
@@ -1501,15 +1584,8 @@ function buildUI(){
   addSlider(secRender, '__accum', 'accumulation', 0, 1, 0.01, v => v.toFixed(2));
   addSlider(secRender, '__hueDrift', 'hue drift', 0, HUE_DRIFT_MAX, 0.001, v => v.toFixed(3));
   addSlider(secRender, '__hueWobble', 'hue wobble', 0, HUE_WOBBLE_MAX, 0.005, v => v.toFixed(3));
+  addSlider(secRender, '__particlePx', 'particle size', 0, PARTICLE_PX_MAX, 1, v => v === 0 ? 'soft' : v + 'px');
 }
-function snapshotCfg(){
-  const o = { cohorts: cfg.cohorts, rule_seed: cfg.rule_seed, rule: Array.from(cfg.rule) };
-  for (const k of PHYS_KEYS) o[k] = cfg[k];
-  o.initial_conditions = cfg.initial_conditions;
-  o.paint_gain = cfg.paint_gain; o.paint_persistence = cfg.paint_persistence;
-  return o;
-}
-function loadGood(){ try { return JSON.parse(localStorage.getItem('hypercells.autopilot.good.v1') || '[]'); } catch (e) { return []; } }
 
 function syncButtons(){
   setPaused(app.paused); setView(app.view);
@@ -1534,38 +1610,7 @@ $('sExplore').oninput = e => { app.exploration = parseFloat(e.target.value); $('
 $('iSeed').onchange = e => { const v = parseInt(e.target.value, 10); if (Number.isFinite(v)) reseed(v); };
 $('sCohorts').oninput = e => { cfg.cohorts = parseInt(e.target.value, 10); $('oCohorts').textContent = cfg.cohorts; ruleDirty = true; };
 $('sCohorts').onchange = () => resetSim(rndRange(0, 1000));
-$('selQuality').onchange = e => { app.simWorldSize = parseFloat(e.target.value); createResources(); };
-
-$('bShare').onclick = () => {
-  const state = {
-    c: snapshotCfg(),
-    a: { view: app.view, brightness: app.brightness, simWorldSize: app.simWorldSize,
-         hard: app.hardPixels, accum: app.accum, seed: app.resetSeed,
-         hueDrift: app.hueDrift, hueWobble: app.hueWobble },
-    seed: app.seed,
-    ap: { enabled: ap.enabled, morphTime: app.morphTime, holdTime: app.holdTime, exploration: app.exploration,
-          phase: ap.phase, currentName: ap.currentName, targetName: ap.targetName },
-  };
-  history.replaceState(null, '', '#c=' + btoa(String.fromCharCode(...new TextEncoder().encode(JSON.stringify(state)))));
-  navigator.clipboard?.writeText(location.href).catch(() => {});
-  $('bShare').textContent = 'link copied!';
-  setTimeout(() => $('bShare').textContent = 'copy state link', 1200);
-};
-$('bSave').onclick = () => {
-  const list = loadGood();
-  list.push({ c: snapshotCfg(), t: Date.now() });
-  try { localStorage.setItem('hypercells.autopilot.good.v1', JSON.stringify(list)); } catch (e) {}
-  H.saved.add(sigOf(currentParams()));
-  $('bSave').textContent = 'saved!';
-  setTimeout(() => $('bSave').textContent = 'save current', 1200);
-};
-$('bExport').onclick = () => {
-  const arr = loadGood().map(g => ({ c: g.c }));
-  const blob = new Blob([JSON.stringify(arr, null, 1)], { type: 'application/json' });
-  const a = document.createElement('a');
-  a.href = URL.createObjectURL(blob); a.download = 'hypercells-autopilot-good.json';
-  a.click(); setTimeout(() => URL.revokeObjectURL(a.href), 1000);
-};
+$('selQuality').onchange = () => { setWorldSize($('selQuality').value); };
 
 window.addEventListener('keydown', e => {
   if (e.target.tagName === 'INPUT' || e.target.tagName === 'SELECT') return;
@@ -1597,12 +1642,12 @@ function loadState(b64){
     cfg.rule = Float32Array.from(s.c.rule);
     clampPhysics(cfg);
     const a = s.a || {};
-    const ws = a.simWorldSize ?? 1;
-    if (ws !== app.simWorldSize){ app.simWorldSize = ws; createResources(); }
+    setWorldSize(a.simWorldSize ?? 1);   // validated: a crafted link must not break the sim
     app.brightness = a.brightness ?? app.brightness;
     app.accum = a.accum ?? app.accum;
     app.hueDrift = clamp(a.hueDrift ?? app.hueDrift, 0, HUE_DRIFT_MAX);
     app.hueWobble = clamp(a.hueWobble ?? app.hueWobble, 0, HUE_WOBBLE_MAX);
+    app.particlePx = clamp(Math.round(a.particlePx ?? app.particlePx), 0, PARTICLE_PX_MAX);
     setView(a.view === 'field' ? 'field' : 'particles');
     if (s.seed !== undefined){ app.seed = s.seed | 0; rng = mulberry32(app.seed >>> 0); }
     if (s.ap){
@@ -1622,6 +1667,452 @@ function loadState(b64){
 }
 
 // ===========================================================================
+// Evolve: LLM-driven evolution through an optional localhost bridge (evolve/bridge.mjs).
+// Without the bridge none of this runs and the page behaves exactly as before.
+//
+// A proposal is a param/rule target (an ordinary autopilot morph) and/or a rewritten GLSL
+// behaviour function. A shader candidate is compiled into a second program that computes the old
+// and the new behaviour side by side; u_blend crossfades the two forces. The health monitor
+// judges the trial: kept (and rebuilt as a single-behaviour program) or blended back out.
+// ===========================================================================
+const GLSL_MAX_BYTES = 6144;
+const GLSL_LOOP_MAX = 16;         // per-loop trip count
+const GLSL_LOOP_PRODUCT_MAX = 32; // product of every loop's trips (over-approximates nesting)
+const BEHAVIOR_SIG = /void\s+behavior\s*\(\s*vec2\s+L\s*,\s*vec2\s+R\s*,\s*vec2\s+axis\s*,\s*Rule\s+rule\s*,\s*out\s+vec2\s+force\s*,\s*out\s+vec2\s+strafe\s*\)\s*\{/g;
+const SANITIZE_GLSL = 'vec2 evo_san(vec2 v){ return (any(isnan(v)) || any(isinf(v))) ? vec2(0.0) : clamp(v, vec2(-1000.0), vec2(1000.0)); }\n';
+
+function stripGlslComments(s){ return s.replace(/\/\*[\s\S]*?\*\//g, ' ').replace(/\/\/[^\n]*/g, ' '); }
+
+// Static contract check, run before anything is compiled. Returns an error string or null.
+function validateGLSL(src){
+  if (typeof src !== 'string' || !src.trim()) return 'empty shader';
+  if (src.length > GLSL_MAX_BYTES) return 'shader is longer than 6 KB';
+  const s = stripGlslComments(src);
+  if (s.indexOf('#') >= 0) return 'preprocessor directives (#) are not allowed';
+  const bad = s.match(/\b(uniform|main|while|do|struct|discard|layout|attribute|varying|buffer|texture\w*|texelFetch\w*|get_can|sampler\w*|image\w*|gl_\w+|goto|asm)\b/);
+  if (bad) return 'forbidden token: ' + bad[0];
+  const sigs = s.match(BEHAVIOR_SIG);
+  if (!sigs || sigs.length !== 1) return 'must define exactly one: void behavior(vec2 L, vec2 R, vec2 axis, Rule rule, out vec2 force, out vec2 strafe)';
+  let depth = 0;
+  for (const ch of s){
+    if (ch === '{') depth++;
+    else if (ch === '}'){ depth--; if (depth < 0) return 'unbalanced braces'; }
+  }
+  if (depth !== 0) return 'unbalanced braces';
+  const re = /\bfor\s*\(/g;
+  let m, loops = 0, product = 1;
+  while ((m = re.exec(s))){
+    let i = re.lastIndex, d = 1;
+    while (i < s.length && d > 0){ if (s[i] === '(') d++; else if (s[i] === ')') d--; i++; }
+    if (d !== 0) return 'unbalanced parentheses in a for loop';
+    const head = s.slice(re.lastIndex, i - 1);
+    const mm = head.match(/^\s*int\s+(\w+)\s*=\s*(\d+)\s*;\s*(\w+)\s*(<|<=)\s*(\d+)\s*;\s*(?:(\w+)\s*\+\+|\+\+\s*(\w+)|(\w+)\s*\+=\s*1)\s*$/);
+    if (!mm || mm[3] !== mm[1] || ![mm[6], mm[7], mm[8]].includes(mm[1]))
+      return 'for loops must look like: for (int i = 0; i < N; i++) with integer literals';
+    const bound = parseInt(mm[5], 10), start = parseInt(mm[2], 10);
+    const trips = bound - start + (mm[4] === '<=' ? 1 : 0);
+    if (bound > GLSL_LOOP_MAX || trips > GLSL_LOOP_MAX) return 'for loop bound exceeds ' + GLSL_LOOP_MAX;
+    loops++; product *= Math.max(trips, 1);
+    if (loops > 3 || product > GLSL_LOOP_PRODUCT_MAX) return 'too many loop iterations (max 3 loops, product of trips <= ' + GLSL_LOOP_PRODUCT_MAX + ')';
+  }
+  return null;
+}
+
+// Give every function / const a candidate suffix so two behaviours (and their helpers) can live
+// in one program without name clashes.
+function renameGlslDefs(src, sfx){
+  const s = stripGlslComments(src);
+  const names = new Set();
+  let m;
+  const fre = /(?:^|[;{}\n])\s*(?:void|float|int|bool|vec[234]|ivec[234]|mat[234])\s+([A-Za-z_]\w*)\s*\(/g;
+  while ((m = fre.exec(s))) names.add(m[1]);
+  const cre = /\bconst\s+(?:float|int|bool|vec[234])\s+([A-Za-z_]\w*)/g;
+  while ((m = cre.exec(s))) names.add(m[1]);
+  let out = s;
+  for (const n of names) out = out.replace(new RegExp('\\b' + n + '\\b', 'g'), n + sfx);
+  return out;
+}
+
+// srcB null: a single-behaviour program (A only). srcB set: both, mixed by u_blend.
+function buildEntityFS(srcA, srcB){
+  const evolved = srcA !== BEHAVIOR_V0 || !!srcB;
+  let fs = ENTITY_HEAD;
+  if (srcB) fs += 'uniform float u_blend;\n';
+  if (evolved) fs += SANITIZE_GLSL;
+  fs += renameGlslDefs(srcA, '_a') + '\n';
+  if (srcB) fs += renameGlslDefs(srcB, '_b') + '\n';
+  const args = '(ltap.xy, rtap.xy, orientation, rule, ';
+  let call;
+  if (!srcB){
+    call = 'behavior_a' + args + 'force, strafe);' + (evolved ? ' force = evo_san(force); strafe = evo_san(strafe);' : '');
+  } else {
+    call = 'vec2 force_a = vec2(0.0), strafe_a = vec2(0.0), force_b = vec2(0.0), strafe_b = vec2(0.0);\n' +
+      '  if (u_blend < 1.0){ behavior_a' + args + 'force_a, strafe_a); force_a = evo_san(force_a); strafe_a = evo_san(strafe_a); }\n' +
+      '  if (u_blend > 0.0){ behavior_b' + args + 'force_b, strafe_b); force_b = evo_san(force_b); strafe_b = evo_san(strafe_b); }\n' +
+      '  force = mix(force_a, force_b, u_blend); strafe = mix(strafe_a, strafe_b, u_blend);';
+  }
+  return fs + ENTITY_MAIN.replace('__BEHAVE__', function(){ return call; });
+}
+
+const parallelCompile = gl.getExtension('KHR_parallel_shader_compile');
+// Compiles and links off the hot path where the driver allows it. Never throws: resolves to
+// { program } or { error }.
+function buildProgramAsync(vs, fs){
+  return new Promise(resolve => {
+    const t0 = performance.now();
+    const vsh = gl.createShader(gl.VERTEX_SHADER); gl.shaderSource(vsh, vs); gl.compileShader(vsh);
+    const fsh = gl.createShader(gl.FRAGMENT_SHADER); gl.shaderSource(fsh, fs); gl.compileShader(fsh);
+    const p = gl.createProgram();
+    gl.attachShader(p, vsh); gl.attachShader(p, fsh); gl.linkProgram(p);
+    const done = res => { gl.deleteShader(vsh); gl.deleteShader(fsh); resolve(res); };
+    const check = () => {
+      if (gl.isContextLost()) return done({ error: 'context lost' });
+      if (parallelCompile && !gl.getProgramParameter(p, parallelCompile.COMPLETION_STATUS_KHR)){
+        if (performance.now() - t0 > 30000){ gl.deleteProgram(p); return done({ error: 'compile timeout' }); }
+        setTimeout(check, 30);
+        return;
+      }
+      if (gl.getProgramParameter(p, gl.LINK_STATUS)) return done({ program: p });
+      const log = (gl.getShaderInfoLog(fsh) || '') + (gl.getShaderInfoLog(vsh) || '') + (gl.getProgramInfoLog(p) || '');
+      gl.deleteProgram(p);
+      done({ error: log.trim().slice(0, 1500) || 'link failed' });
+    };
+    check();
+  });
+}
+
+const EVO_BLEND_MIN_SEC = 3;
+const evo = {
+  blend: 0, on: false, online: false, busy: false, trial: null,
+  interval: 3, shaderEdits: true,
+  glsl: BEHAVIOR_V0, version: 0, versions: [], current: 0, model: null,
+  lastEvolveAt: 0, status: 'bridge offline', lastVerdict: '', wantShot: null,
+};
+
+async function evoApi(path, body, timeoutMs){
+  const ctl = new AbortController();
+  const to = setTimeout(() => ctl.abort(), timeoutMs || 15000);
+  try {
+    const opt = body === undefined ? { signal: ctl.signal }
+      : { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(body), signal: ctl.signal };
+    const r = await fetch('/api' + path, opt);
+    const j = await r.json().catch(() => ({}));
+    if (!r.ok) throw new Error(j.error || ('HTTP ' + r.status));
+    return j;
+  } finally { clearTimeout(to); }
+}
+
+function evoHealthStr(){
+  return 'ratio ' + H.ratio.toFixed(2) + ', mean ' + (H.mean || 0).toFixed(4) + ', ' + (H.dead ? 'dead' : H.fizzy ? 'fizzy' : 'ok');
+}
+function evoHealth(){
+  return { ratio: H.ratio, mean: H.mean || 0, ref: H.ref, good: H.good, goodSec: H.goodSec, badSec: H.badSec,
+           dead: !!H.dead, fizzy: !!H.fizzy, fps: fpsEMA };
+}
+function evoRenderUI(){
+  const bE = $('bEvolve');
+  bE.disabled = !evo.online;
+  bE.textContent = !evo.online ? 'evolve: bridge offline' : 'evolve: ' + (evo.on ? 'on' : 'off');
+  bE.classList.toggle('on', evo.on && evo.online);
+  $('bEvoNow').disabled = !evo.online || evo.busy || !!evo.trial;
+  $('bEvoShader').textContent = 'shader edits: ' + (evo.shaderEdits ? 'on' : 'off');
+  $('bEvoShader').classList.toggle('on', evo.shaderEdits);
+  $('sEvoInt').value = evo.interval; $('oEvoInt').textContent = evo.interval + 'm';
+  const sel = $('selEvoVersion');
+  if (sel !== document.activeElement){
+    const want = evo.versions.map(v => v.n).join(',') + '|' + evo.version;
+    if (sel.dataset.sig !== want){
+      sel.dataset.sig = want;
+      sel.textContent = '';
+      const list = evo.versions.length ? evo.versions : [{ n: 0 }];
+      for (const v of list){
+        const o = document.createElement('option');
+        o.value = String(v.n);
+        o.textContent = 'v' + v.n + (v.n === 0 ? ' (seed)' : '') + (v.n === evo.version ? ' \u2190 now' : '');
+        sel.appendChild(o);
+      }
+      sel.value = String(evo.version);
+    }
+  }
+  sel.disabled = !evo.online || !!evo.trial || evo.busy;
+  $('evoStatus').textContent = 'v' + evo.version + ' \u00b7 ' + evo.status + (evo.lastVerdict ? '\n' + evo.lastVerdict : '');
+}
+function evoSetStatus(t){ evo.status = t; evoRenderUI(); }
+
+const shotCanvas = document.createElement('canvas');
+const shotCtx = shotCanvas.getContext('2d');
+// Called straight after render(), in the same task, so the drawing buffer is still valid.
+function evoAfterRender(){
+  const cb = evo.wantShot;
+  if (!cb) return;
+  evo.wantShot = null;
+  try {
+    const w = canvas.width, h = canvas.height, sc = Math.min(1, 1024 / Math.max(w, h));
+    shotCanvas.width = Math.max(1, Math.round(w * sc)); shotCanvas.height = Math.max(1, Math.round(h * sc));
+    shotCtx.drawImage(canvas, 0, 0, shotCanvas.width, shotCanvas.height);
+    shotCanvas.toBlob(b => {
+      if (!b) return cb(null);
+      const fr = new FileReader();
+      fr.onload = () => cb(String(fr.result).split(',')[1] || null);
+      fr.onerror = () => cb(null);
+      fr.readAsDataURL(b);
+    }, 'image/png');
+  } catch (e){ cb(null); }
+}
+function evoCapture(){
+  return new Promise(res => {
+    const to = setTimeout(() => { evo.wantShot = null; res(null); }, 3000);
+    evo.wantShot = v => { clearTimeout(to); res(v); };
+  });
+}
+function evoTelemetry(png){
+  return { ts: Date.now(), seed: app.seed, cohorts: cfg.cohorts, params: currentParams(), rule: Array.from(cfg.rule),
+           glsl: evo.glsl, version: evo.version, health: evoHealth(), locks: Array.from(ap.locks), png };
+}
+
+function evoBuildTarget(params, rule){
+  const p = currentParams();
+  if (params && typeof params === 'object'){
+    for (const k of PHYS_KEYS){
+      if (ap.locks.has(k) || params[k] === undefined) continue;
+      const v = Number(params[k]);
+      if (Number.isFinite(v)) p[k] = v;
+    }
+  }
+  clampPhysics(p);
+  projectBand(p, classifyFamily(p));
+  clampPhysics(p);
+  let r = null;
+  if (Array.isArray(rule) && rule.length === 80 && rule.every(x => Number.isFinite(Number(x))))
+    r = Float32Array.from(rule, x => clamp(Number(x), -8, 8));
+  return { n: 'llm', generated: true, p, rule: r };
+}
+
+function evoBlendSteps(){ return stepsOf(Math.max(EVO_BLEND_MIN_SEC, app.morphTime)); }
+
+async function evoLaunch(tr, glsl, target){
+  if (glsl){
+    const err = validateGLSL(glsl);
+    if (err){ tr.reject = 'static check: ' + err; return evoFinish(tr, false); }
+    evoSetStatus('compiling candidate\u2026');
+    const r = await buildProgramAsync(QUAD_VS, buildEntityFS(evo.glsl, glsl));
+    if (r.error){ tr.reject = 'compile error: ' + r.error; return evoFinish(tr, false); }
+    if (evo.trial){ gl.deleteProgram(r.program); tr.reject = 'another trial is running'; return evoFinish(tr, false); }
+    tr.glsl = glsl; tr.prog = r.program; tr.baseProg = progEntity;
+    progEntity = r.program; evo.blend = 0; tr.phase = 'blend'; tr.t = 0;
+  } else tr.phase = 'hold';
+  if (target){ tr.target = target; beginMorph(target); }
+  evo.trial = tr;
+  evoSetStatus('trial: ' + tr.kind + ' \u2014 ' + (tr.rationale || '').slice(0, 90));
+}
+
+async function evoHandleProposal(res){
+  const hasGlsl = !!res.glsl && evo.shaderEdits;
+  const hasParams = !!res.params || (Array.isArray(res.rule) && res.rule.length === 80);
+  if (!hasGlsl && !hasParams){
+    evo.lastVerdict = 'skip: ' + String(res.rationale || '').slice(0, 120);
+    evoSetStatus('watching');
+    return;
+  }
+  const tr = { id: res.id, kind: hasGlsl && hasParams ? 'params+shader' : hasGlsl ? 'shader' : 'params',
+               rationale: res.rationale || '', glsl: null, prog: null, baseProg: null, target: null,
+               phase: 'start', t: 0, holdSteps: 0, reject: null };
+  await evoLaunch(tr, hasGlsl ? res.glsl : null, hasParams ? evoBuildTarget(res.params, res.rule) : null);
+}
+
+async function evoRunStep(){
+  if (evo.busy || evo.trial) return;
+  if (!ap.enabled){ evoSetStatus('autopilot is off'); return; }
+  evo.busy = true;
+  evo.lastEvolveAt = performance.now();
+  evoSetStatus('asking the agent\u2026');
+  try {
+    const png = await evoCapture();
+    await evoApi('/telemetry', evoTelemetry(png));
+    const res = await evoApi('/evolve', { allowShader: evo.shaderEdits, locks: Array.from(ap.locks) }, 900000);
+    await evoHandleProposal(res);
+  } catch (e){
+    evoSetStatus('agent error: ' + e.message);
+  } finally {
+    evo.busy = false;
+    evoRenderUI();
+  }
+}
+
+// The health monitor's "bad for more than 5 s" verdict. Outside a shader trial this is the
+// original behaviour (abandon the autopilot target); inside one it rejects the trial instead.
+function evoUnhealthy(){
+  const tr = evo.trial;
+  if (tr && tr.glsl){
+    if (tr.phase !== 'back' && tr.phase !== 'finish' && !tr.reject) tr.reject = 'unhealthy for more than 5 s (' + evoHealthStr() + ')';
+    return;
+  }
+  abandonTarget();
+}
+
+function evoBeginReject(tr){
+  if (tr.glsl){ tr.phase = 'back'; tr.t = 0; tr.backFrom = evo.blend; }
+  else evoFinish(tr, false);
+}
+
+// Runs once per sim step, after the autopilot.
+function evoStep(){
+  const tr = evo.trial;
+  if (!tr || tr.phase === 'finish') return;
+  if (tr.phase === 'back'){
+    tr.t++;
+    const n = Math.max(60, Math.round(evoBlendSteps() * 0.35));
+    evo.blend = tr.backFrom * (1 - smootherstep(tr.t / n));
+    if (tr.t >= n){
+      evo.blend = 0;
+      progEntity = tr.baseProg;
+      gl.deleteProgram(tr.prog);
+      evoFinish(tr, false);
+    }
+    return;
+  }
+  if (!tr.reject && tr.target){
+    if (!ap.enabled) tr.reject = 'autopilot was switched off';
+    else if (ap.target !== tr.target) tr.reject = ap.blacklist.has(sigOf(tr.target.p)) ? 'abandoned by the health monitor' : 'autopilot target was replaced';
+  }
+  if (tr.reject) return evoBeginReject(tr);
+  if (tr.phase === 'blend'){
+    tr.t++;
+    const n = evoBlendSteps();
+    evo.blend = smootherstep(tr.t / n);
+    if (tr.t >= n){ evo.blend = 1; tr.phase = 'hold'; tr.holdSteps = 0; }
+    return;
+  }
+  if (tr.phase === 'hold'){
+    if (tr.noJudge && !tr.target) return evoAccept(tr);
+    if (!tr.target || ap.phase === 'hold') tr.holdSteps++;
+    if (tr.holdSteps >= stepsOf(app.holdTime)){
+      if (tr.noJudge || H.good) evoAccept(tr);
+      else { tr.reject = 'unhealthy at the end of the trial (' + evoHealthStr() + ')'; evoBeginReject(tr); }
+    }
+  }
+}
+
+function evoAccept(tr){
+  if (!tr.glsl) return evoFinish(tr, true);
+  tr.phase = 'finish';
+  buildProgramAsync(QUAD_VS, buildEntityFS(tr.glsl, null)).then(r => {
+    if (r.error){
+      tr.reject = 'single-program rebuild failed: ' + r.error;
+      tr.phase = 'hold';
+      evoBeginReject(tr);
+      return;
+    }
+    // u_blend is 1 here, so the single program computes exactly what the pair was showing
+    gl.deleteProgram(tr.prog);
+    gl.deleteProgram(tr.baseProg);
+    progEntity = r.program;
+    evo.blend = 0;
+    evo.glsl = tr.glsl;
+    evoFinish(tr, true);
+  });
+}
+
+async function evoFinish(tr, accepted){
+  const reason = accepted ? 'accepted' : (tr.reject || 'rejected');
+  if (!accepted && tr.target && ap.target === tr.target) abandonTarget();
+  if (evo.trial === tr) evo.trial = null;
+  // a dead field cannot recover on its own (no velocity left to sense), so respawn it
+  if (!accepted && (H.dead || (H.mean || 0) < 0.12 * H.ref)) resetSim(rndRange(0, 1000));
+  evo.lastVerdict = (accepted ? 'kept: ' + tr.rationale : 'rolled back: ' + reason).slice(0, 160);
+  evoSetStatus(accepted ? 'trial kept' : 'trial rolled back');
+  const png = await evoCapture();
+  try {
+    const r = await evoApi('/verdict', { id: tr.id, accepted, reason, kind: tr.kind, rationale: tr.rationale,
+      revert: tr.revert ? tr.version : undefined, glsl: accepted && tr.glsl && !tr.revert ? tr.glsl : undefined,
+      params: tr.target ? tr.target.p : undefined, health: evoHealth(), png });
+    if (accepted && tr.glsl && typeof r.version === 'number'){
+      evo.version = r.version;
+      evo.current = r.version;
+    }
+    if (r.versions) evo.versions = r.versions;
+  } catch (e){
+    evo.lastVerdict += ' (verdict not delivered: ' + e.message + ')';
+    if (accepted && tr.glsl && tr.revert) evo.version = tr.version;
+  }
+  evoSetStatus(evo.on ? 'watching' : 'idle');
+}
+
+async function evoRevert(n){
+  if (evo.trial || evo.busy || n === evo.version) return evoRenderUI();
+  try {
+    const glsl = n === 0 ? BEHAVIOR_V0 : (await evoApi('/versions/' + n)).glsl;
+    const tr = { id: 'revert-' + Date.now(), kind: 'revert', rationale: 'revert to v' + n, glsl: null, prog: null, baseProg: null,
+                 target: null, phase: 'start', t: 0, holdSteps: 0, reject: null, noJudge: true, revert: true, version: n };
+    await evoLaunch(tr, glsl, null);
+  } catch (e){ evoSetStatus('revert failed: ' + e.message); }
+}
+
+// On page load: put the bridge's current version straight in, no trial.
+async function evoApplyInstant(glsl, n){
+  if (validateGLSL(glsl)) return;
+  const r = await buildProgramAsync(QUAD_VS, buildEntityFS(glsl, null));
+  if (r.error) return;
+  if (evo.trial){ gl.deleteProgram(r.program); return; }
+  gl.deleteProgram(progEntity);
+  progEntity = r.program;
+  evo.glsl = glsl; evo.version = n;
+}
+
+async function evoPoll(first){
+  try {
+    const s = await evoApi('/status');
+    evo.online = !!s.ok; evo.model = s.model || null;
+    const v = await evoApi('/versions');
+    evo.versions = v.versions || []; evo.current = v.current | 0;
+    if (first === true && evo.current > 0){
+      const j = await evoApi('/versions/' + evo.current);
+      await evoApplyInstant(j.glsl, evo.current);
+    }
+    if (!evo.trial && !evo.busy) evo.status = evo.on ? 'watching' : 'idle';
+  } catch (e){
+    evo.online = false;
+    evo.on = false;
+    if (!evo.trial) evo.status = 'bridge offline';
+  }
+  evoRenderUI();
+}
+function evoTimer(){
+  if (!evo.on || !evo.online || evo.busy || evo.trial || app.paused || !ap.enabled) return;
+  if (performance.now() - evo.lastEvolveAt >= evo.interval * 60000) evoRunStep();
+}
+
+canvas.addEventListener('webglcontextlost', e => {
+  e.preventDefault();
+  if (!evo.on && !evo.trial) return;
+  const tr = evo.trial;
+  const go = () => setTimeout(() => location.reload(), 1500);
+  if (tr){
+    fetch('/api/verdict', { method: 'POST', headers: { 'content-type': 'application/json' }, keepalive: true,
+      body: JSON.stringify({ id: tr.id, accepted: false, reason: 'webgl context lost during the trial', kind: tr.kind,
+                             rationale: tr.rationale, health: { fps: fpsEMA } }) }).then(go, go);
+  } else go();
+});
+
+function evoInit(){
+  $('bEvolve').onclick = () => {
+    if (!evo.online) return;
+    evo.on = !evo.on;
+    if (evo.on) evo.lastEvolveAt = performance.now() - evo.interval * 60000 + 15000;
+    evoSetStatus(evo.on ? 'watching' : 'idle');
+  };
+  $('bEvoNow').onclick = () => { if (evo.online) evoRunStep(); };
+  $('bEvoShader').onclick = () => { evo.shaderEdits = !evo.shaderEdits; evoRenderUI(); };
+  $('sEvoInt').oninput = e => { evo.interval = parseInt(e.target.value, 10); $('oEvoInt').textContent = evo.interval + 'm'; };
+  $('selEvoVersion').onchange = e => evoRevert(parseInt(e.target.value, 10));
+  evoRenderUI();
+  if (location.protocol === 'file:'){ evo.status = 'bridge offline (open the page through the bridge URL)'; evoRenderUI(); return; }
+  evoPoll(true);
+  setInterval(evoPoll, 10000);
+  setInterval(evoTimer, 1000);
+}
+
+// ===========================================================================
 // Init
 // ===========================================================================
 initGL();
@@ -1637,19 +2128,13 @@ $('iSeed').value = String(app.seed);
 applyAnchorState(ANCHORS[0], rndRange(0, 1000));
 ap.currentName = ANCHORS[0].n;
 ap.holdLeft = stepsOf(app.holdTime);
-// remember what is already saved so the health monitor does not re-save duplicates
-for (const g of loadGood()){
-  if (!g || !g.c) continue;
-  const p = {};
-  for (const k of PHYS_KEYS) p[k] = g.c[k];
-  clampPhysics(p);
-  H.saved.add(sigOf(p));
-}
 syncUI();
 syncLocks();
 syncButtons();
 loadState((location.hash.match(/#c=(.+)/) || [null, null])[1] || '');
 window.addEventListener('hashchange', () => { const m = location.hash.match(/#c=(.+)/); if (m) loadState(m[1]); });
+
+evoInit();
 
 let fpsEMA = 60, lastNow = performance.now();
 let hudTick = 0;
@@ -1668,12 +2153,14 @@ function frame(now){
   if (!app.paused){
     for (let i = 0; i < FIXED_STEPS; i++){
       if (ap.enabled) autopilotStep();
+      evoStep();
       advance();
       simStep++;
       if (simStep % 30 === 0) healthTick();
     }
   }
   render();
+  evoAfterRender();
   if ((hudTick++ % 8) === 0){ updateHUD(); syncUI(); }
   requestAnimationFrame(frame);
 }

@@ -1,0 +1,1 @@
+{"name":"hypercells-evolve","private":true,"type":"module","version":"0.1.0","scripts":{"start":"node bridge.mjs"},"dependencies":{"@earendil-works/pi-coding-agent":"^1.3.0"}}
