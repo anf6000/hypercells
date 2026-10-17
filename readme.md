@@ -6,7 +6,7 @@ field, sense it with two mirrored sensors, and steer through an evolvable 80-flo
 rule ("the organism"). This file explains the folder layout after the 2026-10-16 sort, the
 differences between the shader/pipeline versions, every control in every build's UI, and
 the LLM-evolution tooling. `docs/index.html` is an older, illustrated deep-dive site on the
-two autopilot builds; see §11 for its stale filename mapping.
+two autopilot builds; see §9 for its stale filename mapping.
 
 ---
 
@@ -14,10 +14,11 @@ two autopilot builds; see §11 for its stale filename mapping.
 
 ```
 hypercells/
-├── documentation.md            ← this file
+├── readme.md                   ← this file
 ├── .gitignore                  ← keeps the ~35 GB of recordings out of git
 ├── simple/                     ← baseline interactive build (simple/index.html)
 ├── avoid/                      ← simple + particle-density avoidance (avoid/index.html)
+├── fight/                      ← avoid + cohort battles and rule evolution (fight/index.html)
 ├── color/                      ← gallery build: colour textures, presets, config auto-cycling
 ├── hypercells-4k/              ← 4K autopilot build (standalone, everything inlined)
 ├── evolve/                     ← autopilot show + LLM evolution tooling
@@ -43,12 +44,13 @@ hypercells/
 |---|---|
 | simple | open `simple/index.html` in a browser (fully self-contained) |
 | avoid | open `avoid/index.html` (simple + particle avoidance, fully self-contained) |
+| fight | open `fight/index.html` (avoid + cohort battles and rule evolution, fully self-contained) |
 | color | open `color/index.html` (loads `../config/configs.js` + `../config/textures.js`) |
 | autopilot | open `hypercells-4k/hypercells-4k.html` — or `evolve/hypercells-evolve.html` for the no-bridge show |
 | evolve | `cd evolve && npm install && node bridge.mjs`, then open `http://localhost:8787/hypercells-evolve.html` and switch **evolve: on** |
 | docs site | open `docs/index.html` |
 
-All five apps render full-screen; press `h` to reveal the control panel. Everything is
+All six apps render full-screen; press `h` to reveal the control panel. Everything is
 offline and free — there are no network calls (the bridge only talks to localhost).
 
 ---
@@ -81,6 +83,7 @@ the particles into colour groups, each running its own mutation of the shared ru
 |---|---|---|---|
 | **simple** | `simple/index.html` | hypercells — fluoddity-style physarum | stripped-back *interactive* build: draw mode, manual control, auto-mutates every 90 s |
 | **avoid** | `avoid/index.html` | hypercells — particle avoidance | simple + a decaying particle-density field and a clamped repulsion force, with strength/radius/memory controls |
+| **fight** | `fight/index.html` | hypercells — cohort fight | avoid + mutable per-particle cohorts: local strength keys, colour-blended conversions, population readback, and rounds that mutate the winner's rule into a new cohort set |
 | **color** | `color/index.html` | hypercells — fluoddity-style physarum | *gallery* build: image-derived colour palettes, presets, config auto-cycling, blend/tonemap paths, no draw mode |
 | **autopilot** | `evolve/hypercells-evolve.html` | hypercells — autopilot | *self-animating* build + LLM evolution: glide-morphs between 17 anchors, health-monitored, bridgeable to an LLM that rewrites the behaviour shader |
 | **4K** | `hypercells-4k/hypercells-4k.html` | hypercells — autopilot 4K | exactly the autopilot build with 7 constants changed for 4K output (§3.4) |
@@ -148,6 +151,54 @@ a separable blur and a decay/combine draw) and one extra force term:
   stale density. Reset clears it too.
 - This is soft repulsion: it creates lanes and strongly reduces crossings, but does not
   mathematically guarantee that two particle trajectories never intersect.
+
+### 3.1c fight — shader/pipeline differences
+
+The fight build is `avoid` plus a mutable cohort state texture, three fight passes and a
+population readback. Simulation, avoidance, rendering and the size dropdown are unchanged.
+
+- **Per-particle state.** Two `RGBA32F` textures the size of the entity texture hold
+  `(cohort, prevCohort, convertFrame, 0)`. `ENTITY_FS` reads its cohort from the state
+  texture instead of deriving it from the index; `STATE_INIT_FS` writes the old
+  `floor(cohorts·index/count)` assignment on reset/new organism/size change/cohort-slider
+  changes.
+- **Dominance pass.** A new **R32F grid at the avoidance resolution** is cleared to zero each
+  step, then every particle draws one tiny covering triangle at its position (`~1 texel` of
+  area). The fragment writes `floor(roll·65536)·32 + cohort`, where
+  `roll = hash(index, frame) · trait` and `trait = (0.9 + 0.2·hash(rule_seed, cohort)) ·
+  (1 + share)`. The grid uses **`gl.MAX` blending**, so each cell keeps the strongest key;
+  a cohort with more particles in a cell is proportionally more likely to own it (Lanchester's
+  local majority). `share` is the cohort's population fraction from the last readback, which
+  gives a large cohort a mild tie-break.
+- **Fight pass.** A fullscreen pass reads the state and position, samples the dominance cell
+  at the particle's position, and if `key > 0`, `key mod 32 ≠ cohort` and
+  `hash(index, frame) < aggression`, rewrites the state to `(winner, own, frame)`. During the
+  next `blend_seconds·60` steps the particle is **immune**, so boundaries cannot flicker. If
+  no local enemy is present, a particle may still defect to the **global leader** once that
+  leader holds more than 50%: `aggression · 0.5 · (leaderShare − 0.5)` per step. This is the
+  closure mechanism for isolated pockets; without it the 99% test can stall forever on a
+  dense clump that never meets an opponent.
+- **Population readback.** Every 30 rendered frames (`~0.5 s` at 60 fps) an instanced
+  **1-point splat per particle** additively fills a `24×1` R32F histogram; `readPixels`
+  returns one float per cohort. The HUD bar shows the shares as a stacked strip in cohort
+  hues. The same readback updates `share`, the leader and the win test.
+- **Rounds.** When the leader holds **≥ 99%** of the particles, `nextRound(winner)` reads the
+  winner's row (40 texels) from the per-cohort rule texture, rebuilds the 80-float rule,
+  generates a **new `rule_seed`** (so the next cohort set is a fresh mutation), and
+  `ROUND_FS` re-deals the map into contiguous **angular sectors** around the centre. Every
+  particle starts with `prev = winner` and blends its hue to the new sector hue over the
+  blend time (shortest arc; the two-half hue drift and per-particle noise keep keying off the
+  current cohort). The round counter increments and the HUD shows it.
+- **Auto-mutate is disabled** in this build: rounds take over that role. The **mutate**
+  button (key `m`) still works. Changing `cohorts` restarts the round immediately; size
+  changes, reset and new organism reinitialise the state and reset the round to 1.
+- **Controls.** `battle: on/off` button + key `b` (off = dominance, fights, readback and
+  rounds are skipped; colours and behaviour freeze); **aggression** 0–0.3, default 0.05
+  (0 = no conversions); **blend** 0.25–4 s, default 1.0 (converted to frames at 60 fps).
+- **Performance.** The fight build adds one MAX-blended instanced splat, one fullscreen state
+  pass, and a 24×1 histogram + readback every 30 frames. There is no per-particle CPU work
+  and no extra per-frame texture upload. On the 128k default the extra cost is a few
+  milliseconds per frame; sizes scale like `avoid`.
 
 ### 3.2 color — shader/pipeline differences
 
@@ -223,19 +274,24 @@ At 3840×2160 the present pass runs 1:1 with no scaling at all.
 
 ### 3.5 Shader programs per build
 
-| Program (pass) | simple | color | autopilot | 4K |
-|---|---|---|---|---|
-| `QUAD_VS` — shared fullscreen quad | ✔ | ✔ | ✔ | ✔ |
-| `ENTITY_FS` — particle move | ✔ (rule in uniforms, in-shader mutate) | ✔ (same) | ✔ (fixed head + behaviour + main; rule texture) | ✔ (same + speed cap, aspect-aware wrap) |
-| `BRUSH` — instanced gaussian deposit | ✔ | ✔ | ✔ | ✔ (+ deposit normalisation) |
-| `CANVAS_FS` — diffuse + decay (both layers) | ✔ (fixed paint constants) | ✔ (paint gain/fade/diffusion sliders) | ✔ (paint gain derived from persistence) | ✔ (paint pass skipped in particle view) |
-| `FIELD_FS` — field view (hue-map of paint) | ✔ | ✔ | ✔ | ✔ |
-| `SPRITE` — particle view | 1:3 velocity dashes, per-particle jitter, opacity | texture-coloured, crossfading textures, blend modes | golden-angle palette, two-tier vividness, soft/hard px | same |
-| `COMP_FS` — accumulation composite | ✔ | ✔ (+ solid fade / additive branches) | ✔ | ✔ |
-| `TONEMAP_FS` — asinh tonemap (additive) | – | ✔ | – | – |
-| `UVASSIGN_FS` — spawn→texture coords (paint mode) | – | ✔ | – | – |
-| `PRESENT_FS` — integer-scaled letterboxed blit | ✔ | ✔ | ✔ | ✔ (per-axis float fit fallback) |
-| `REDUCE_FS` — 32×32 health readback | – | – | ✔ | ✔ |
+| Program (pass) | simple | color | autopilot | 4K | fight |
+|---|---|---|---|---|---|
+| `QUAD_VS` — shared fullscreen quad | ✔ | ✔ | ✔ | ✔ | ✔ |
+| `ENTITY_FS` — particle move | ✔ (rule in uniforms, in-shader mutate) | ✔ (same) | ✔ (fixed head + behaviour + main; rule texture) | ✔ (same + speed cap, aspect-aware wrap) | ✔ (rule texture; cohort read from state) |
+| `BRUSH` — instanced gaussian deposit | ✔ | ✔ | ✔ | ✔ (+ deposit normalisation) | ✔ |
+| `CANVAS_FS` — diffuse + decay (both layers) | ✔ (fixed paint constants) | ✔ (paint gain/fade/diffusion sliders) | ✔ (paint gain derived from persistence) | ✔ (paint pass skipped in particle view) | ✔ (paint skipped outside field view) |
+| `FIELD_FS` — field view (hue-map of paint) | ✔ | ✔ | ✔ | ✔ | ✔ |
+| `SPRITE` — particle view | 1:3 velocity dashes, per-particle jitter, opacity | texture-coloured, crossfading textures, blend modes | golden-angle palette, two-tier vividness, soft/hard px | same | dashes + state-driven cohort/previous hue blend |
+| `COMP_FS` — accumulation composite | ✔ | ✔ (+ solid fade / additive branches) | ✔ | ✔ | ✔ |
+| `TONEMAP_FS` — asinh tonemap (additive) | – | ✔ | – | – | – |
+| `UVASSIGN_FS` — spawn→texture coords (paint mode) | – | ✔ | – | – | – |
+| `PRESENT_FS` — integer-scaled letterboxed blit | ✔ | ✔ | ✔ | ✔ (per-axis float fit fallback) | ✔ |
+| `REDUCE_FS` — 32×32 health readback | – | – | ✔ | ✔ | – |
+| `STATE_INIT_FS` — per-particle cohort init | – | – | – | – | ✔ |
+| `ROUND_FS` — re-deal angular sectors | – | – | – | – | ✔ |
+| `DOMINANCE_VS/FS` — MAX-blended strength keys | – | – | – | – | ✔ |
+| `FIGHT_FS` — conversion + blend immunity | – | – | – | – | ✔ |
+| `HISTOGRAM_VS/FS` — 24×1 population splat | – | – | – | – | ✔ |
 
 ### 3.6 The behaviour function and its versioning
 
@@ -325,7 +381,7 @@ are written once in the shared column.
 | hue drift | `app.hueDrift` (`__hueDrift`) | autopilot/4K 0…0.01, step 0.001 (0.010) | Rate at which the whole cohort palette travels (cycles/s). simple drifts a fixed 0.005 with a two-half scheme; color replaces hue with textures. |
 | hue wobble | `app.hueWobble` (`__hueWobble`) | autopilot/4K 0…0.05, step 0.005 (0.04) | Bounded per-cohort hue breathing (amplitude of a sine on the group's phase), so the palette inhales/exhales but never drifts away. |
 
-### 4.2b Avoidance sliders (avoid only)
+### 4.2b Avoidance sliders (avoid, fight)
 
 | Slider | Key | Range (default) | What it does |
 |---|---|---|---|
@@ -335,12 +391,21 @@ are written once in the shared column.
 
 The `avoid: on/off` button (key `a`) toggles the two avoidance passes; enabling it clears stale density. Reset clears the density field as well.
 
+### 4.2c Battle sliders (fight only)
+
+| Slider | Key | Range (default) | What it does |
+|---|---|---|---|
+| aggression | `aggression` | 0…0.3, step 0.001 (0.05) | Per-step chance that a beaten particle converts to the winner of its dominance cell (and, once a leader is above 50%, chance scale for isolated defections). 0 = no conversions; cohorts stay fixed. |
+| blend | `blend_seconds` | 0.25…4 s, step 0.05 (1.0) | Colour crossfade from the old cohort hue to the new one, converted to frames at 60 fps. The particle is immune to further conversion for the whole blend. |
+
+The `battle: on/off` button (key `b`) pauses fights and rounds; the state textures and the bar stay where they are. The HUD shows the round number and a thin stacked bar with one segment per cohort in its hue. Auto-mutate is disabled in this build; the rounds mutate the rule instead. `mutate` (`m`) and `new organism` (`n`) still work.
+
 ### 4.3 Organism & world
 
 | Control | Builds | Values (default) | What it does |
 |---|---|---|---|
-| cohorts | all | 1…24 (simple 7; others 12) | Number of colour groups. Each group runs its own mutation of the shared rule (rule texture columns); on change later builds reset the sim. Particles start in a **ring** in every build. |
-| size | avoid | 128k (512²) / 256k (724²) / 512k (1024²) / 1024k (1448²); default **128k** | Particle count and flow-field edge scale together (constant density per texel). Changing size recreates the textures, resets the sim, and scales `avoid_radius` by the edge ratio. The present pass fits every size to the window. |
+| cohorts | all | 1…24 (simple/avoid/fight 7; others 12) | Number of colour groups. Each group runs its own mutation of the shared rule (rule texture columns); color/autopilot reset the sim on change, fight restarts the battle round (positions stay). Particles start in a **ring** in every build. |
+| size | avoid, fight | 128k (512²) / 256k (724²) / 512k (1024²) / 1024k (1448²); default **128k** | Particle count and flow-field edge scale together (constant density per texel). Changing size recreates the textures, resets the sim, and scales `avoid_radius` by the edge ratio; fight also resets the round to 1. The present pass fits every size to the window. |
 | world size | color, autopilot | tiny 0.08 / small 0.25 / medium 0.5 / **large 1.0** | Scales everything: particles 48k/150k/300k/600k and field 289/512/724/1024 texels (the field edge is `1024×√size` so tuned distances hold). |
 | world size | 4K | **0.5M / 1M / 2M** | Particle count only (density knob): 500k/1M/2M particles, the 3840×2160 field is fixed, and deposits are normalised so strength is unchanged. |
 | start | color | random / grid / **ring** | Initial layout. grid = one spawn spot per cohort; ring = cohorts evenly on a circle. Other builds: ring only (hazard respawns are always random). |
@@ -393,6 +458,8 @@ flips them into family A (gain < 2.2) or B bands, and cross-mutates rules; a bla
 | evolve / evolve now / shader edits / version | – | – | ✔ (bridge only) |
 | copy state link / save json / load json | – | ✔ | – (state lives in the URL `#c=` / `?seed=` instead) |
 | hide panel (`h`) | panel | panel | panel **and** HUD |
+
+**fight** shares every avoid button/key (`space`, `r`, `n`, `m`, `d`, `f`, `p`, `a`, `h`) and adds `battle: on/off` (`b`); see §4.2c. The battle bar sits directly under the HUD.
 
 Panel visibility: every build ships with the panel hidden on boot; `h` reveals it.
 
@@ -468,6 +535,13 @@ simple-only: `PAINT_GAIN 0.016`, `PAINT_PERSISTENCE 0.995`, `DRAW_RADIUS 0.05`,
 
 color-only: `SPRITE_SIZE 1.5`, `TONEMAP_SOFTNESS 3.9`, `BRIGHTNESS_CONSTANT 2.0`,
 `AUTO_DWELL 120`, `AUTO_FADE 10`, `TEX_FADE_MS 2500`, `ARTIFICIAL_HUES` (12 values).
+
+fight-only: `POP_INTERVAL 30` frames between population readbacks, `WIN_SHARE 0.99`, blend
+frames = `blend_seconds·60`, dominance key `floor(roll·65536)·32 + cohort`, local trait
+`(0.9 + 0.2·hash(seed, cohort))·(1 + share)`, global defection rate
+`aggression·0.5·(leaderShare − 0.5)` above 50%, `RULE_COLS 40 / RULE_ROWS 24`. Auto-mutate
+is off (the rounds mutate). `STATE_INIT_FS`, `ROUND_FS`, `DOMINANCE_VS/FS`, `FIGHT_FS` and
+`HISTOGRAM_VS/FS` are the added programs.
 
 ---
 
