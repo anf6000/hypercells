@@ -107,13 +107,29 @@ autopilot show, seeded and offline).
 
 ### 3.1b avoid — shader/pipeline differences
 
-The avoidance build is `simple` plus one extra offscreen stage (a decay draw + an instanced
-density deposit) and one extra force term:
+The avoidance build is `simple` plus one extra offscreen stage (an instanced density deposit,
+a separable blur and a decay/combine draw) and one extra force term:
 
-- A separate **RGBA32F density field at half the flow-field edge** (256² at 128k, 362² at
+- A separate **R32F density field at half the flow-field edge** (256² at 128k, 362² at
   256k, 512² at 512k, 724² at 1024k) is ping-ponged independently of the flow field. Each
-  step it decays by `avoid_fade` (memory) and receives one normalized 2-D Gaussian splat
-  per particle (half-size 3 avoid texels).
+  step the moved particles are bilinear-splatted (4 fragments each) into a scratch layer,
+  blurred with a separable 7-tap gaussian (together equivalent to a σ 1.32-texel splat),
+  and added to the previous field decayed by `avoid_fade` (memory). The blur wraps like
+  the world.
+- **Performance structure** (measured on an Intel UHD 630: 128k 81.5 → 11.9 ms/frame,
+  1024k 417 → 84 ms/frame):
+  - instanced splats/sprites draw **one covering triangle** per particle (fragments outside
+    the quad are discarded) instead of a `TRIANGLE_FAN` quad, which ANGLE/D3D11 emulates;
+  - the per-cohort mutated rule is computed by a tiny **rule pass** into a 40×24 texture
+    (frequency, amplitude, sin/cos of the phase offsets) only when the rule, seed or
+    mutation scale change; the entity pass evaluates base and mirrored signals in one loop
+    with two transcendentals per center (angle addition) — bit-identical on the first step;
+  - layers allocate only the channels they read: flow/paint/brush **RG32F**, avoidance
+    **R32F**, display/accumulation **RGBA16F**; the brush writes `vel·k²` with a ONE/ONE
+    blend (same values as before);
+  - invisible work is skipped: the paint layer updates only in field view (reseeded from
+    the flow field × 3.2, its equilibrium ratio, on entry), the accumulation composite is
+    skipped at 0, the hazard hash is skipped at rate 0, and the HUD updates at 4 Hz.
 - **Size dropdown** (Organism section): `128k` (512² field, default), `256k` (724²),
   `512k` (1024²), `1024k` (1448²). Particle count and field edge scale together so density
   per texel is constant. Changing size recreates the textures, resets the simulation, and
