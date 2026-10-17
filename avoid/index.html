@@ -1,0 +1,1123 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, user-scalable=no">
+<link rel="icon" href="data:,">
+<title>hypercells — particle avoidance</title>
+<!--
+WebGL reimplementation of the Fluoddity algorithm (aphid91, github.com/aphid91/Fluoddity-Core).
+Vector-trail physarum: particles deposit 2D flow into a field, sense it with two mirrored
+sensors, and steer via an evolvable 10-term Fourier-feature rule. Four GPU passes per physics
+step: move (GPGPU entity ping-pong) -> deposit (instanced gaussian sprites) -> diffuse (canvas
+update) -> paint (permanent copy of the deposits). Display adds an optional accumulation buffer
+(long exposure) before a nearest-neighbour/fitted present. Particles render solid (source-over
+alpha); the view toggles between particles and a hue-mapped view of the paint/flow field.
+
+Avoidance variant: an extra density field (half the flow-field edge) is decayed and splatted
+from the particle positions every step. Particles sample its gradient with four axial taps
+and add a clamped repulsion force, so nearby streams spread into lanes instead of crossing
+through each other. The avoidance field has its own persistence (memory) and is independent
+of the sensed flow. The size dropdown scales particle count and both grids together
+(128k at 512² by default); the present pass fits every size to the window.
+-->
+<style>
+  :root { --accent:#0000ff; --panel:#0d1014; --line:rgba(255,255,255,.09); }
+  html,body { margin:0; height:100%; overflow:hidden; background:#000; }
+  canvas#c { position:fixed; inset:0; width:100vw; height:100vh; display:block; }
+  canvas#c.drawing { cursor:crosshair; }
+  #panel { position:fixed; top:14px; right:14px; width:308px; max-height:calc(100vh - 28px);
+    overflow-y:auto; background:var(--panel); border:1px solid var(--line); padding:12px 14px 10px; color:#cfd8dc;
+    font:12px/1.45 ui-monospace,Consolas,monospace; user-select:none; }
+  #panel.hidden { display:none; }
+  #panel::-webkit-scrollbar { width:8px; } #panel::-webkit-scrollbar-thumb { background:#2a3138; }
+  .title { font-size:13px; color:#fff; letter-spacing:.4px; display:flex; justify-content:space-between; align-items:center; }
+  .title a { color:var(--accent); text-decoration:none; font-size:10px; }
+  .sec { margin-top:10px; border-top:1px solid var(--line); padding-top:8px; }
+  .sec>h4 { margin:0 0 6px; font-size:10px; letter-spacing:1.2px; text-transform:uppercase; color:#8a939b; font-weight:600; }
+  .row { display:grid; grid-template-columns: 92px 1fr 52px; gap:8px; align-items:center; margin:3px 0; }
+  .row label { color:#aeb6bd; font-size:11px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+  .row output { text-align:right; color:#eff3f5; font-size:11px; font-variant-numeric:tabular-nums; }
+  input[type=range] { -webkit-appearance:none; appearance:none; width:100%; height:10px; margin:0; background:transparent; --p:0%; }
+  input[type=range]::-webkit-slider-runnable-track { height:2px; background:linear-gradient(to right, var(--accent) var(--p), #2a3138 var(--p)); }
+  input[type=range]::-webkit-slider-thumb { -webkit-appearance:none; appearance:none; width:8px; height:8px; margin-top:-3px; background:var(--accent); }
+  input[type=range]::-moz-range-track { height:2px; background:#2a3138; }
+  input[type=range]::-moz-range-progress { height:2px; background:var(--accent); }
+  input[type=range]::-moz-range-thumb { width:8px; height:8px; border:0; background:var(--accent); }
+  select { width:100%; background:#1b2026; color:#dfe5e8; border:1px solid var(--line);
+    padding:4px 2px; font:11px ui-monospace,monospace; cursor:pointer; }
+  select:focus { outline:none; border-color:var(--accent); }
+  .btns { display:grid; grid-template-columns:repeat(3,1fr); gap:6px; margin-top:8px; }
+  button { background:#1b2026; color:#dfe5e8; border:1px solid var(--line); padding:6px 4px;
+    font:11px ui-monospace,monospace; cursor:pointer; }
+  button:hover { border-color:var(--accent); color:#fff; }
+  button.on { background:#121242; border-color:var(--accent); color:var(--accent); }
+  .hint { margin-top:10px; color:#5d666e; font-size:10px; line-height:1.6; border-top:1px solid var(--line); padding-top:6px; }
+  .hint b { color:#9aa3ab; font-weight:600; }
+  #hud { position:fixed; left:14px; bottom:12px; color:#7d868e; font:11px ui-monospace,monospace; user-select:none; }
+  #err { position:fixed; inset:0; margin:auto; width:min(720px,90vw); height:max-content; background:#1a1113; color:#ffb4b4;
+    padding:24px; border:1px solid #5a2a2a; border-radius:12px; font:12px ui-monospace,monospace; white-space:pre-wrap; display:none; z-index:10; }
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<div id="panel" class="hidden">
+  <div class="title"><span>hypercells</span><a href="https://github.com/aphid91/Fluoddity-Core" target="_blank" rel="noreferrer">algorithm: Fluoddity-Core &#8599;</a></div>
+  <div class="btns">
+    <button id="bPause">pause</button><button id="bReset">reset</button><button id="bNew">new</button>
+    <button id="bMutate">mutate</button><button id="bDraw">draw</button><button id="bView">view: particles</button>
+    <button id="bHard">hard px</button>
+    <button id="bAvoid">avoid: on</button>
+  </div>
+  <div class="sec"><h4>Organism</h4>
+    <div class="row"><label>size</label><select id="sSize"></select><output id="oSize"></output></div>
+    <div class="row"><label>cohorts</label><input type="range" id="sCohorts" min="1" max="24" step="1"><output id="oCohorts"></output></div>
+  </div>
+  <div class="sec"><h4>Avoidance</h4><div id="secAvoid"></div></div>
+  <div class="sec"><h4>Physics</h4><div id="secPhysics"></div></div>
+  <div class="sec"><h4>Field &amp; render</h4><div id="secField"></div></div>
+  <div class="hint"><b>space</b> pause &nbsp;· <b>r</b> reset &nbsp;· <b>n</b> new organism &nbsp;· <b>m</b> mutate &nbsp;· <b>d</b> draw mode &nbsp;· <b>f</b> field view &nbsp;· <b>p</b> hard pixels &nbsp;· <b>a</b> avoidance &nbsp;· <b>h</b> hide panel. In draw mode, drag to push the flow field.</div>
+</div>
+<div id="hud"></div>
+<div id="err"></div>
+<script type="module">
+const $ = id => document.getElementById(id);
+const errbox = $('err');
+let errored = false;
+function fatal(msg){ if (errored) return; errored = true; errbox.style.display = 'block'; errbox.textContent = msg; if (parent !== window) throw new Error(msg); }
+window.addEventListener('error', e => fatal('Error: ' + e.message + (e.filename ? '\n' + e.filename + ':' + e.lineno : '')));
+
+function fitCanvasBacking(){
+  const c = $('c');
+  const w = Math.max(2, Math.round(window.innerWidth));
+  const h = Math.max(2, Math.round(window.innerHeight));
+  if (c.width !== w || c.height !== h){ c.width = w; c.height = h; }
+}
+fitCanvasBacking();
+window.addEventListener('resize', fitCanvasBacking);
+
+const gl = $('c').getContext('webgl2', {alpha:false, antialias:false, depth:false, stencil:false, powerPreference:'high-performance'});
+if (!gl) fatal('WebGL2 is not available in this browser.');
+if (!gl.getExtension('EXT_color_buffer_float')) fatal('EXT_color_buffer_float is not available; cannot run the GPU simulation.');
+gl.getExtension('EXT_float_blend');
+const floatLinear = !!gl.getExtension('OES_texture_float_linear');
+
+function compile(type, src){
+  const s = gl.createShader(type); gl.shaderSource(s, src); gl.compileShader(s);
+  if (!gl.getShaderParameter(s, gl.COMPILE_STATUS)) fatal('Shader compile failed:\n' + gl.getShaderInfoLog(s));
+  return s;
+}
+const locCache = new WeakMap();
+function loc(p, n){ let c = locCache.get(p); if (!c) locCache.set(p, c = {}); if (!(n in c)) c[n] = gl.getUniformLocation(p, n); return c[n]; }
+function makeProgram(vs, fs){
+  const p = gl.createProgram();
+  gl.attachShader(p, compile(gl.VERTEX_SHADER, vs));
+  gl.attachShader(p, compile(gl.FRAGMENT_SHADER, fs));
+  gl.linkProgram(p);
+  if (!gl.getProgramParameter(p, gl.LINK_STATUS)) fatal('Program link failed:\n' + gl.getProgramInfoLog(p));
+  return p;
+}
+function u1i(p, n, v){ const l = loc(p, n); if (l) gl.uniform1i(l, v|0); }
+function u1f(p, n, v){ const l = loc(p, n); if (l) gl.uniform1f(l, v); }
+function u2f(p, n, v){ const l = loc(p, n); if (l) gl.uniform2f(l, v[0], v[1]); }
+function u4f(p, n, v){ const l = loc(p, n); if (l) gl.uniform4f(l, v[0], v[1], v[2], v[3]); }
+function bindTex(unit, tex, p, name){ gl.activeTexture(gl.TEXTURE0 + unit); gl.bindTexture(gl.TEXTURE_2D, tex); u1i(p, name, unit); }
+
+const QUAD_VS = `#version 300 es
+layout(location=0) in vec2 in_position;
+out vec2 uv;
+void main(){ uv = in_position * 0.5 + 0.5; gl_Position = vec4(in_position, 0.0, 1.0); }`;
+
+const ENTITY_FS = `#version 300 es
+precision highp float;
+precision highp int;
+
+struct FourierCenter { vec4 frequency; vec4 amplitude; };
+struct Rule { FourierCenter centers[10]; };
+uniform Rule config_rule;
+
+uniform vec4 config_a;  // cohorts, rule_seed, sensor_gain, sensor_angle
+uniform vec4 config_b;  // sensor_distance, mutation_scale, global_force_mult, drag
+uniform vec4 config_c;  // strafe_power, axial_force, lateral_force, hazard_rate
+
+uniform float u_reset_seed;
+
+uniform sampler2D entity_texture;
+uniform sampler2D canvas_texture;
+uniform sampler2D avoid_texture;
+uniform vec4 config_avoid;  // radius (world units), strength, enabled, unused
+uniform int frame_count;
+uniform int entity_count;
+uniform int entity_tex_width;
+
+in vec2 uv;
+out vec4 fragColor;
+
+#define PI 3.1415926
+#define AVOID_FORCE_SCALE 0.002
+#define AVOID_FORCE_MAX 0.004
+
+uint pcg_hash(uint seed){
+  uint state = seed * 747796405u + 2891336453u;
+  uint word = ((state >> ((state >> 28u) + 4u)) ^ state) * 277803737u;
+  return (word >> 22u) ^ word;
+}
+float hash(vec2 co){
+  uvec2 u = uvec2(floatBitsToUint(co.x), floatBitsToUint(co.y));
+  uint h = pcg_hash(u.x ^ pcg_hash(u.y));
+  return float(h) / float(0xffffffffu);
+}
+vec4 hash4(vec2 co){
+  return vec4(hash(co), hash(co * -1.0 + 5.0), hash(co.yx - 100.0), hash(co.yx * -1.0 + 25.0));
+}
+vec4 fourier_noise(FourierCenter centers[10], vec4 signals){
+  vec4 result = vec4(0.0);
+  for (int i = 0; i < 10; i++){
+    float phase = dot(signals, centers[i].frequency);
+    float phase_offset = 2.0 * float(i) * 0.6283 + centers[i].amplitude.w * 3.14159;
+    vec4 basis = vec4(
+      sin(phase + phase_offset),
+      cos(phase + phase_offset * 0.7),
+      sin(phase * 2.0 + phase_offset * 1.3),
+      cos(phase * 2.0 + phase_offset * 0.5));
+    result += centers[i].amplitude * basis;
+  }
+  return result;
+}
+FourierCenter[10] generate_random_centers(float seed){
+  FourierCenter centers[10];
+  for (int i = 0; i < 10; i++){
+    float freq_scale = 1.0 + 2.0 * pow(hash(vec2(seed, float(i * 8 + 0))), 2.0);
+    centers[i].frequency.x = (hash(vec2(seed, float(i * 8 + 0))) * 2.0 - 1.0) * freq_scale;
+    centers[i].frequency.y = (hash(vec2(seed, float(i * 8 + 1))) * 2.0 - 1.0) * freq_scale;
+    centers[i].frequency.z = (hash(vec2(seed, float(i * 8 + 2))) * 2.0 - 1.0) * freq_scale;
+    centers[i].frequency.w = (hash(vec2(seed, float(i * 8 + 3))) * 2.0 - 1.0) * freq_scale;
+    centers[i].amplitude.x = hash(vec2(seed, float(i * 8 + 4))) * 2.0 - 1.0;
+    centers[i].amplitude.y = hash(vec2(seed, float(i * 8 + 5))) * 2.0 - 1.0;
+    centers[i].amplitude.z = hash(vec2(seed, float(i * 8 + 6))) * 2.0 - 1.0;
+    centers[i].amplitude.w = hash(vec2(seed, float(i * 8 + 7))) * 2.0 - 1.0;
+  }
+  return centers;
+}
+void mutate_rule(inout Rule current_rule, float amount, float cohort){
+  float seed = hash(current_rule.centers[4].frequency.xy + current_rule.centers[7].amplitude.yx + current_rule.centers[1].frequency.zw) + cohort;
+  for (int i = 0; i < 10; i++){
+    vec4 amp_mutation = amount * (-1.0 + 2.0 * hash4(-0.5 + vec2(-float(i) + seed, float(i))));
+    current_rule.centers[i].amplitude += amp_mutation;
+    current_rule.centers[i].frequency *= 1.0 + amount * 0.5 * (hash(vec2(seed, float(i))) - 0.5);
+  }
+}
+void pR(inout vec2 p, float a){ p = cos(a) * p + sin(a) * vec2(p.y, -p.x); }
+vec4 get_can(vec2 p){ return texture(canvas_texture, p * 0.5 + 0.5); }
+vec2 safenorm(vec2 p){ return length(p) == 0.0 ? vec2(0.0) : normalize(p); }
+float get_cohort(int index){ return float(config_a.x) * float(index) / float(entity_count); }
+
+vec4 do_reset(int index){
+  float cohort_val = get_cohort(index);
+  float cohorts = config_a.x;
+  vec2 pos = 0.019 * (vec2(hash(vec2(cohort_val, u_reset_seed)), hash(vec2(cohort_val + float(index) + 2.142, u_reset_seed + 0.5))) - 0.5);
+  vec2 vel = 0.01 * 0.005 * (vec2(hash(vec2(cohort_val, float(index))), hash(vec2(cohort_val, pos.y))) * 2.0 - 1.0);
+  float angle = cohort_val / cohorts * 2.0 * PI;   // ring start: cohorts spread evenly around a circle
+  pos += vec2(cos(angle), sin(angle)) * 0.5;
+  return vec4(pos, vel);
+}
+vec4 black_box(vec2 L, vec2 R, Rule rule){ return fourier_noise(rule.centers, vec4(L, R)); }
+vec2 y_reflect(vec2 p){ return p * vec2(1.0, -1.0); }
+
+void calculate_entity_behavior(vec2 L, vec2 R, vec2 axis, Rule rule, out vec2 force, out vec2 strafe){
+  vec2 forward = safenorm(axis);
+  vec2 left = vec2(forward.y, -forward.x);
+  L = vec2(dot(L, forward), dot(L, left));
+  R = vec2(dot(R, forward), dot(R, left));
+  vec4 baseterm = black_box(L, R, rule);
+  vec4 mirrorterm = black_box(y_reflect(R), y_reflect(L), rule);
+  force = baseterm.xy + y_reflect(mirrorterm.xy);
+  strafe = baseterm.zw + y_reflect(mirrorterm.zw);
+  // axial/lateral scale the LOCAL frame components (scaling world x/y here caused the vertical bias)
+  force  = forward * (force.x  * config_c.y) + left * (force.y  * config_c.z);
+  strafe = forward * (strafe.x * config_c.y) + left * (strafe.y * config_c.z);
+}
+
+void main(){
+  ivec2 pixel = ivec2(gl_FragCoord.xy);
+  int index = pixel.y * entity_tex_width + pixel.x;
+  if (index >= entity_count){ fragColor = vec4(0.0); return; }
+
+  vec4 e = texelFetch(entity_texture, pixel, 0);
+  vec2 pos = e.xy, vel = e.zw;
+  float cohort = get_cohort(index);
+  Rule rule = config_rule;
+
+  bool hazard_reset = config_c.w > hash(vec2(float(index) / float(entity_count), float(frame_count)));
+  if (frame_count == 0 || hazard_reset){ fragColor = do_reset(index); return; }
+
+  float sample_dist = 0.005 * config_b.x;
+  vec2 orientation = safenorm(vel);
+  vec2 lso = orientation; pR(lso,  config_a.w * PI);
+  vec2 rso = orientation; pR(rso, -config_a.w * PI);
+  vec4 ltap = get_can(pos + lso * sample_dist);
+  vec4 rtap = get_can(pos + rso * sample_dist);
+
+  if (rule.centers[0].frequency == vec4(0) && rule.centers[5].amplitude == vec4(0))
+    rule = Rule(generate_random_centers(config_a.y + floor(cohort)));
+  mutate_rule(rule, config_b.y, config_a.y + floor(cohort));
+
+  float sensor_scaling = 38.855 * config_a.z;
+  ltap *= sensor_scaling;
+  rtap *= sensor_scaling;
+
+  vec2 strafe = vec2(0.0), force = vec2(0.0);
+  calculate_entity_behavior(ltap.xy, rtap.xy, orientation, rule, force, strafe);
+  force *= config_b.z / 400.0;
+  strafe *= config_b.z / 20.0;
+
+  vec2 avoid_force = vec2(0.0);
+  if (config_avoid.z > 0.5){
+    vec2 uv0 = pos * 0.5 + 0.5;
+    vec2 ox = vec2(config_avoid.x * 0.5, 0.0);
+    vec2 oy = vec2(0.0, config_avoid.x * 0.5);
+    float dl = texture(avoid_texture, uv0 - ox).r;
+    float dr = texture(avoid_texture, uv0 + ox).r;
+    float dd = texture(avoid_texture, uv0 - oy).r;
+    float du = texture(avoid_texture, uv0 + oy).r;
+    float dc = texture(avoid_texture, uv0).r;
+    vec2 grad = vec2(dr - dl, du - dd) / (1.0 + dc);
+    avoid_force = clamp(-grad * (config_avoid.y * AVOID_FORCE_SCALE), vec2(-AVOID_FORCE_MAX), vec2(AVOID_FORCE_MAX));
+  }
+
+  vel = vel * config_b.w + force + avoid_force;
+  pos += vel;
+  pos += strafe * config_c.x;
+  pos = 2.0 * (fract(pos / 2.0 - 0.5) - 0.5);
+  fragColor = vec4(pos, vel);
+}`;
+
+const AVOID_DECAY_FS = `#version 300 es
+precision highp float;
+uniform sampler2D avoid_texture;
+uniform float avoid_fade;
+in vec2 uv;
+out vec4 fragColor;
+void main(){
+  fragColor = vec4(texture(avoid_texture, uv).r * avoid_fade, 0.0, 0.0, 1.0);
+}`;
+
+const AVOID_DEPOSIT_VS = `#version 300 es
+layout(location=0) in vec2 a_offset;
+layout(location=1) in vec2 a_uv;
+uniform sampler2D entity_texture;
+uniform int entity_tex_width;
+uniform float u_half_size;
+out vec2 v_uv;
+void main(){
+  ivec2 tc = ivec2(gl_InstanceID % entity_tex_width, gl_InstanceID / entity_tex_width);
+  vec4 entity = texelFetch(entity_texture, tc, 0);
+  vec2 p = entity.xy + a_offset * u_half_size;
+  gl_Position = vec4(p, 0.0, 1.0);
+  v_uv = a_uv;
+}`;
+
+const AVOID_DEPOSIT_FS = `#version 300 es
+precision highp float;
+in vec2 v_uv;
+uniform float u_weight;
+out vec4 fragColor;
+float gaussian(vec2 pos, float sigma){
+  float sigma2 = sigma * sigma;
+  return exp(-dot(pos, pos) / (2.0 * sigma2)) / (2.0 * 3.14159265359 * sigma2);
+}
+void main(){
+  vec2 q = v_uv - 0.5;
+  if (length(q) > 0.5) discard;
+  fragColor = vec4(gaussian(q, 0.22) * u_weight, 0.0, 0.0, 0.0);
+}`;
+
+const BRUSH_VS = `#version 300 es
+layout(location=0) in vec2 a_offset;
+layout(location=1) in vec2 a_uv;
+uniform sampler2D entity_texture;
+uniform int entity_tex_width;
+out vec2 v_uv;
+out vec4 v_pos_vel;
+void main(){
+  ivec2 tc = ivec2(gl_InstanceID % entity_tex_width, gl_InstanceID / entity_tex_width);
+  vec4 entity = texelFetch(entity_texture, tc, 0);
+  vec2 vp = entity.xy + a_offset * 0.0015;
+  gl_Position = vec4(vp, 0.0, 1.0);
+  v_uv = a_uv;
+  v_pos_vel = entity;
+}`;
+
+const BRUSH_FS = `#version 300 es
+precision highp float;
+in vec2 v_uv;
+in vec4 v_pos_vel;
+layout(location = 0) out vec4 brush_out;
+uniform int frame_count;
+float gaussian(vec2 pos, float sigma){
+  float sigma2 = sigma * sigma;
+  float norm = 1.0 / (2.0 * 3.14159265359 * sigma2);
+  float exponent = -(dot(pos, pos)) / (2.0 * sigma2);
+  return norm * exp(exponent);
+}
+void main(){
+  float kernel_func = gaussian(v_uv - 0.5, 0.163);
+  if (length(v_uv - 0.5) > 0.5 || frame_count == 0) discard;
+  vec2 vel = v_pos_vel.zw;
+  brush_out = vec4(vel, 0.01, 1.0) * kernel_func;
+}`;
+
+const CANVAS_FS = `#version 300 es
+precision highp float;
+uniform float persistence;          // trail persistence of this layer
+uniform float gain;                 // deposit gain of this layer
+uniform vec4 trail_draw_mouse;      // cur.xy, prev.xy in canvas uv space
+uniform float trail_draw_radius;
+uniform float trail_draw_power;
+uniform vec2 canvas_resolution;
+uniform sampler2D brush_texture;
+uniform sampler2D canvas_texture;
+uniform int frame_count;
+in vec2 uv;
+out vec4 canvas_out;
+vec4 getCan(vec2 p, sampler2D sam){ return texture(sam, fract(p)); }
+vec4 getBlur(vec2 pos, sampler2D sam, float K){
+  vec3 off = vec3(1.0 / vec2(textureSize(sam, 0)), 0.0);
+  vec4 nc = getCan(pos + off.zy, sam); vec4 sc = getCan(pos - off.zy, sam);
+  vec4 wc = getCan(pos - off.xz, sam); vec4 ec = getCan(pos + off.xz, sam);
+  return (getCan(pos, sam) * K + nc + sc + wc + ec) / (4.0 + K);
+}
+float draw_kernel(float distance, float sigma){ return exp(-distance * distance / (2.0 * sigma * sigma)); }
+void main(){
+  if (frame_count < 2){ canvas_out = vec4(0.0, 0.0, 0.0, 1.0); return; }
+  vec4 brush_color = texture(brush_texture, uv);
+  vec4 canvas_color = getBlur(uv, canvas_texture, 1.0);   // fixed diffusion (K = 1)
+  canvas_out = canvas_color * persistence + vec4(brush_color.xy, 0.0, 1.0) * gain;
+  if (trail_draw_power > 0.0 && trail_draw_radius > 0.0){
+    vec2 mouse_vel = trail_draw_mouse.xy - trail_draw_mouse.zw;
+    vec2 delta = uv - trail_draw_mouse.xy;
+    delta.x *= canvas_resolution.x / canvas_resolution.y;
+    float kernel_weight = draw_kernel(length(delta), trail_draw_radius);
+    vec2 draw_vector = mouse_vel * (trail_draw_power / 5.0);
+    canvas_out.xy += draw_vector * kernel_weight / trail_draw_radius;
+  }
+  canvas_out.w = 1.0;
+}`;
+
+const FIELD_FS = `#version 300 es
+precision highp float;
+uniform sampler2D tex;
+uniform float brightness;
+uniform float u_hard;
+in vec2 uv; out vec4 fragColor;
+vec3 hsv2rgb(vec3 c){
+  vec4 K = vec4(1.0, 2.0 / 3.0, 1.0 / 3.0, 3.0);
+  vec3 p = abs(fract(c.xxx + K.xyz) * 6.0 - K.www);
+  return c.z * mix(K.xxx, clamp(p - K.xxx, 0.0, 1.0), c.y);
+}
+void main(){
+  vec2 res = vec2(textureSize(tex, 0));
+  vec2 suv = u_hard > 0.5 ? (floor(uv * res) + 0.5) / res : uv;
+  vec4 canv = texture(tex, suv);
+  float speed = length(canv.xy);
+  if (speed < 1e-6){ fragColor = vec4(0.0, 0.0, 0.0, 1.0); return; }
+  float tone = speed / (speed + 1.0);
+  vec3 rgb = hsv2rgb(vec3(atan(canv.y, canv.x) / 6.2831853, 0.75, tone)) * 1.5;
+  fragColor = vec4(rgb, 1.0);
+  fragColor.xyz *= brightness;
+}`;
+
+const SPRITE_VS = `#version 300 es
+#define SPRITE_ASPECT 3.0
+#define COLOR_NOISE 0.03   // per-particle hue jitter (fraction of the hue circle)
+uniform sampler2D entity_texture;
+uniform int entity_tex_width;
+uniform int entity_count;
+uniform int cohorts;
+uniform vec2 u_field_px;     // field size in texels: particle size is measured in texels
+uniform float u_particle_px; // particle width (short axis) in field texels
+uniform float u_hue_drift;   // per-frame hue drift (already scaled by rate)
+uniform float u_snap;        // 1: pin the centre to a texel centre (crisp small particles)
+out vec2 v_uv;
+out vec4 v_color;
+uint pcg_hash(uint seed){
+  uint state = seed * 747796405u + 2891336453u;
+  uint word = ((state >> ((state >> 28u) + 4u)) ^ state) * 277803737u;
+  return (word >> 22u) ^ word;
+}
+float hash_float(uint x){ return float(pcg_hash(x)) / float(0xffffffffu); }
+void main(){
+  ivec2 tc = ivec2(gl_InstanceID % entity_tex_width, gl_InstanceID / entity_tex_width);
+  vec4 entity = texelFetch(entity_texture, tc, 0);
+  vec2 entity_pos = entity.xy;
+  int cohort_index = int(floor(float(gl_InstanceID) * float(cohorts) / float(entity_count)));
+  float hue = hash_float(uint(cohort_index) * 2654435761u);
+  // two groups drift apart: lower half of the cohorts slides toward -hue, upper half toward +hue
+  float hue_dir = float(cohort_index) < float(cohorts) * 0.5 ? -1.0 : 1.0;
+  // a little per-particle colour noise (fixed per particle) so a cohort is never a flat fill
+  float noise = (hash_float(uint(gl_InstanceID) * 2246822519u) - 0.5) * 2.0 * COLOR_NOISE;
+  v_color = vec4(fract(hue + hue_dir * u_hue_drift + noise), 0.8, 1.0, 1.0);
+  // 1:SPRITE_ASPECT dash aligned with the direction of travel
+  vec2 vel = entity.zw;
+  vec2 along = length(vel) > 1e-8 ? normalize(vel) : vec2(1.0, 0.0);
+  vec2 across = vec2(-along.y, along.x);
+  vec2 texel = 2.0 / u_field_px;   // clip units per field texel
+  float half_w = u_particle_px * 0.5;
+  vec2 half_ax = along * (half_w * SPRITE_ASPECT * texel.x);
+  vec2 half_cr = across * (half_w * texel.x);
+  vec2 centre = entity_pos;
+  if (u_snap > 0.5){   // a 1-texel sprite then lands on exactly one pixel instead of a texel boundary
+    vec2 t = (centre * 0.5 + 0.5) * u_field_px;
+    centre = (floor(t) + 0.5) / u_field_px * 2.0 - 1.0;
+  }
+  vec2 offsets[4] = vec2[4](half_ax + half_cr, half_ax - half_cr, -half_ax - half_cr, -half_ax + half_cr);
+  vec2 uv_coords[4] = vec2[4](vec2(0.0, 0.0), vec2(1.0, 0.0), vec2(1.0, 1.0), vec2(0.0, 1.0));
+  bool visible = abs(entity_pos.x) <= 1.0 && abs(entity_pos.y) <= 1.0;
+  vec2 vp = centre + (visible ? offsets[gl_VertexID] : vec2(0.0));
+  gl_Position = vec4(vp, 0.0, 1.0);
+  v_uv = uv_coords[gl_VertexID];
+}`;
+
+const SPRITE_FS = `#version 300 es
+precision highp float;
+in vec2 v_uv;
+in vec4 v_color;
+out vec4 fragColor;
+uniform float brightness;
+uniform float u_hard;
+uniform float u_opacity;
+vec3 hsv2rgb(vec3 c){
+  vec4 K = vec4(1.0, 2.0 / 3.0, 1.0 / 3.0, 3.0);
+  vec3 p = abs(fract(c.xxx + K.xyz) * 6.0 - K.www);
+  return c.z * mix(K.xxx, clamp(p - K.xxx, 0.0, 1.0), c.y);
+}
+float gaussian(vec2 pos, float sigma){
+  float sigma2 = sigma * sigma;
+  float norm = 1.0 / (2.0 * 3.14159265359 * sigma2);
+  float exponent = -(dot(pos, pos)) / (2.0 * sigma2);
+  return norm * exp(exponent);
+}
+void main(){
+  vec2 centered_uv = v_uv - 0.5;
+  float kernel = u_hard > 0.5 ? 1.0 : 0.5 * gaussian(centered_uv, 0.163);
+  if (u_hard < 0.5 && length(centered_uv) > 0.5) discard;
+  vec3 rgb = hsv2rgb(v_color.xyz) * brightness;
+  fragColor = vec4(rgb, min(v_color.w * kernel, 1.0) * u_opacity);
+}`;
+
+// Accumulation is TRAIL PERSISTENCE, not an exposure average:
+//   0 = the buffer keeps nothing, so only the live frame shows (no trails)
+//   1 = the buffer is never cleared, so every mark stays where it was painted
+// The live frame is always drawn at full strength -- only how much of what is already on the
+// buffer survives is scaled by the slider -- so the picture can never dim or freeze.
+const COMP_FS = `#version 300 es
+precision highp float;
+uniform sampler2D view_tex;
+uniform sampler2D accum_tex;
+uniform float accum_amount;
+in vec2 uv; out vec4 o;
+void main(){
+  vec4 v = texture(view_tex, uv);
+  vec4 a = texture(accum_tex, uv);
+  // the buffer is kept, faded by the slider, and this frame is painted over it
+  float keep = clamp(accum_amount, 0.0, 1.0);
+  float va = clamp(v.a, 0.0, 1.0);
+  o = vec4(v.rgb + a.rgb * keep * (1.0 - va), va + a.a * keep * (1.0 - va));
+}`;
+
+const PRESENT_FS = `#version 300 es
+precision highp float;
+uniform sampler2D tex;
+uniform ivec2 offset;   // integer window->sim offset
+uniform float scale;    // display scale (integer when snap = 1)
+uniform int snap;       // 1: nearest texel, 0: filtered fractional fit
+out vec4 o;
+void main(){
+  vec2 sp = vec2(ivec2(gl_FragCoord.xy) - offset);
+  float sz = float(textureSize(tex, 0).x) * scale;
+  if (any(lessThan(sp, vec2(0.0))) || any(greaterThanEqual(sp, vec2(sz)))){ o = vec4(0.0, 0.0, 0.0, 1.0); return; }
+  if (snap == 1){
+    int k = int(scale + 0.5);
+    o = vec4(texelFetch(tex, ivec2(sp) / k, 0).rgb, 1.0);
+  } else {
+    o = vec4(texture(tex, (sp + 0.5) / sz).rgb, 1.0);
+  }
+}`;
+
+// Fixed layer settings (previously runtime sliders).
+const PAINT_GAIN = 0.016;
+const PAINT_PERSISTENCE = 0.995;
+const DRAW_RADIUS = 0.05;
+const DRAW_POWER = 0.3;
+const MUTATE_INTERVAL_MS = 90000;
+const HUE_DRIFT_PER_SEC = 0.005;   // per-cohort hue drift (hue units/second); full cycle ~200 s
+// Particle count and field edge move together so density per texel stays constant.
+const SIZE_OPTIONS = [
+  { label: '128k',  count: 128000,  edge: 512  },
+  { label: '256k',  count: 256000,  edge: 724  },
+  { label: '512k',  count: 512000,  edge: 1024 },
+  { label: '1024k', count: 1024000, edge: 1448 },
+];
+const AVOID_SPLAT_TEXELS = 3.0;    // half-size of one particle's density splat, in avoid texels
+const AVOID_DEPOSIT_WEIGHT = 1 / Math.pow(2 * AVOID_SPLAT_TEXELS, 2);
+
+let cfg = {
+  cohorts: 7,
+  rule_seed: 0.4862983671108597,
+  sensor_gain: 1.01,
+  sensor_angle: -0.7777777777777778,
+  sensor_distance: -1.22,
+  mutation_scale: 0.405,
+  global_force_mult: -0.33,
+  drag: 0.561,
+  strafe_power: 0.066,
+  axial_force: 0.359,
+  lateral_force: -1.294,
+  hazard_rate: 0,
+  avoid_strength: 0.35,
+  avoid_radius: 6,
+  avoid_fade: 0.97,
+  trail_persistence: 0.975,
+  rule: [1.2064379453659058,1.067139744758606,1.2132219076156616,-0.12498120963573456,1.5426808595657349,-0.2381400465965271,-1.6898831129074097,1.2356244325637817,-0.7950752973556519,0.8675197958946228,0.7583622336387634,0.8555039763450623,-0.4020692706108093,0.31403112411499023,-1.0033940076828003,-0.7093168497085571,3.5040769577026367,3.050676107406616,1.4465839862823486,2.246659517288208,-2.1314163208007812,-0.002818688750267029,-0.37139642238616943,1.2416610717773438,1.1865310668945312,1.286213755607605,-0.9745411276817322,-0.6409617066383362,-0.021761491894721985,0.7107173800468445,-0.20683011412620544,0.2877289354801178,1.4541025161743164,1.0496876239776611,1.4966915845870972,-0.9024308323860168,-0.10237443447113037,-1.4029918909072876,-0.17698410153388977,-1.4599552154541016,-0.5519824624061584,0.684830904006958,0.5333976745605469,-0.8555260896682739,0.9248912334442139,-1.845164179801941,0.904996395111084,0.9833927154541016,-0.8521580100059509,-0.9560102224349976,-0.252249538898468,-0.28091707825660706,0.7234344482421875,0.8838722109794617,1.5286259651184082,-0.26113516092300415,0.3846791386604309,-1.164605975151062,0.06522984057664871,0.14904245734214783,-0.1396895945072174,-0.6890721321105957,0.642676591873169,0.3004353642463684,-0.11368437111377716,-0.0009936660062521696,-0.759465754032135,-1.0703999996185303,1.16761314868927,-0.7396655082702637,0.8717650175094604,-1.5144052505493164,2.6468586921691895,1.8602746725082397,-1.087221384048462,2.2106218338012695,-0.9733583927154541,-1.1184961795806885,0.107132688164711,-0.1786668747663498],
+};
+const app = { paused:false, draw:false, view:'particles', brightness:0.74, accum:0, particlePx:1,
+              opacity:0.5, hardPixels:false, avoid:true, sizeIndex:0, resetSeed:1 };
+const mouse = { uv:[0,0], prev:[0,0], down:false, moved:false };
+
+let C = null;
+const entityTex = [null,null], entityFBO = [null,null];
+const canvasTex = [null,null], canvasFBO = [null,null];
+const paintTex = [null,null], paintFBO = [null,null];
+const avoidTex = [null,null], avoidFBO = [null,null];
+let brushTex = null, brushFBO = null;
+let entityPing = 0, canvasPing = 0, paintPing = 0, avoidPing = 0, frameCount = 0, ruleDirty = true;
+let progEntity, progBrush, progCanvas, progField, progSprite, progComp, progPresent;
+let progAvoidDecay, progAvoidDeposit;
+let quadVAO, brushVAO;
+let sceneBufTex = null, sceneBufFBO = null;
+const accumTex = [null, null], accumFBO = [null, null];
+let accumPing = 0;
+
+const _f32b = new Float32Array(1), _u32b = new Uint32Array(_f32b.buffer);
+const f32 = x => { _f32b[0] = x; return _f32b[0]; };
+const b32 = f => { _f32b[0] = f; return _u32b[0]; };
+const pcgJS = seed => { seed = (Math.imul(seed, 747796405) + 2891336453) | 0; let w = ((seed >>> ((seed >>> 28) + 4)) ^ seed) >>> 0; w = Math.imul(w, 277803737) >>> 0; return ((w >>> 22) ^ w) >>> 0; };
+const hashJS = (x, y) => pcgJS((b32(x) ^ pcgJS(b32(y))) >>> 0) / 0xffffffff;
+const hash4JS = (x, y) => [
+  hashJS(x, y),
+  hashJS(f32(-x + 5.0), f32(-y + 5.0)),
+  hashJS(f32(y - 100.0), f32(x - 100.0)),
+  hashJS(f32(-y + 25.0), f32(-x + 25.0)),
+];
+function randomOrganism(seed){
+  const rule = [];
+  for (let i = 0; i < 10; i++){
+    const j = i * 8;
+    const h0 = hashJS(seed, j);
+    const scale = f32(1 + f32(2 * f32(h0 * h0)));
+    rule.push(f32(f32(h0 * 2 - 1) * scale));
+    for (let k = 1; k < 4; k++) rule.push(f32(f32(hashJS(seed, j + k) * 2 - 1) * scale));
+    for (let k = 4; k < 8; k++) rule.push(f32(hashJS(seed, j + k) * 2 - 1));
+  }
+  return rule;
+}
+function mutateOrganism(rule, amount, cohortSeed){
+  const r = rule.slice();
+  const sx = f32(f32(r[32] + r[61]) + r[10]);
+  const sy = f32(f32(r[33] + r[60]) + r[11]);
+  const seed = f32(hashJS(sx, sy) + cohortSeed);
+  for (let i = 0; i < 10; i++){
+    const b = i * 8;
+    const h4 = hash4JS(f32(-0.5 + f32(-i + seed)), f32(-0.5 + i));
+    for (let k = 0; k < 4; k++) r[b + 4 + k] = f32(r[b + 4 + k] + f32(amount * f32(-1 + 2 * h4[k])));
+    const fq = f32(1 + f32(f32(amount * 0.5) * f32(hashJS(seed, i) - 0.5)));
+    for (let k = 0; k < 4; k++) r[b + k] = f32(r[b + k] * fq);
+  }
+  return r;
+}
+
+function computeConstants(){
+  const size = SIZE_OPTIONS[app.sizeIndex] || SIZE_OPTIONS[0];
+  const entityCount = size.count;
+  const canvasWidth = size.edge, canvasHeight = size.edge;
+  const avoidRes = Math.max(128, Math.round(size.edge / 2));
+  const entityTexWidth = Math.ceil(Math.sqrt(entityCount));
+  const entityTexHeight = Math.ceil(entityCount / entityTexWidth);
+  return { entityCount, canvasWidth, canvasHeight, avoidRes, sizeLabel: size.label, entityTexWidth, entityTexHeight };
+}
+function floatTex(w, h, linear){
+  const t = gl.createTexture();
+  gl.bindTexture(gl.TEXTURE_2D, t);
+  gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA32F, w, h, 0, gl.RGBA, gl.FLOAT, null);
+  const filt = linear && floatLinear ? gl.LINEAR : gl.NEAREST;
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, filt);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, filt);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.REPEAT);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.REPEAT);
+  return t;
+}
+function screenTex(w, h){
+  const t = floatTex(w, h, true);
+  gl.bindTexture(gl.TEXTURE_2D, t);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+  return t;
+}
+function fboOf(tex){
+  const f = gl.createFramebuffer();
+  gl.bindFramebuffer(gl.FRAMEBUFFER, f);
+  gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_2D, tex, 0);
+  if (gl.checkFramebufferStatus(gl.FRAMEBUFFER) !== gl.FRAMEBUFFER_COMPLETE) fatal('Framebuffer incomplete');
+  gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+  return f;
+}
+function makeQuadVAO(){
+  const vao = gl.createVertexArray();
+  gl.bindVertexArray(vao);
+  const vbo = gl.createBuffer();
+  gl.bindBuffer(gl.ARRAY_BUFFER, vbo);
+  gl.bufferData(gl.ARRAY_BUFFER, new Float32Array([-1,-1, 1,-1, 1,1, -1,-1, 1,1, -1,1]), gl.STATIC_DRAW);
+  gl.enableVertexAttribArray(0);
+  gl.vertexAttribPointer(0, 2, gl.FLOAT, false, 0, 0);
+  gl.bindVertexArray(null);
+  return vao;
+}
+function makeBrushVAO(){
+  const vao = gl.createVertexArray();
+  gl.bindVertexArray(vao);
+  const vbo = gl.createBuffer();
+  gl.bindBuffer(gl.ARRAY_BUFFER, vbo);
+  gl.bufferData(gl.ARRAY_BUFFER, new Float32Array([-1,-1,0,0, 1,-1,1,0, 1,1,1,1, -1,1,0,1]), gl.STATIC_DRAW);
+  gl.enableVertexAttribArray(0); gl.vertexAttribPointer(0, 2, gl.FLOAT, false, 16, 0);
+  gl.enableVertexAttribArray(1); gl.vertexAttribPointer(1, 2, gl.FLOAT, false, 16, 8);
+  gl.bindVertexArray(null);
+  return vao;
+}
+function initGL(){
+  progEntity  = makeProgram(QUAD_VS, ENTITY_FS);
+  progBrush   = makeProgram(BRUSH_VS, BRUSH_FS);
+  progCanvas  = makeProgram(QUAD_VS, CANVAS_FS);
+  progField   = makeProgram(QUAD_VS, FIELD_FS);
+  progSprite  = makeProgram(SPRITE_VS, SPRITE_FS);
+  progComp    = makeProgram(QUAD_VS, COMP_FS);
+  progPresent = makeProgram(QUAD_VS, PRESENT_FS);
+  progAvoidDecay   = makeProgram(QUAD_VS, AVOID_DECAY_FS);
+  progAvoidDeposit = makeProgram(AVOID_DEPOSIT_VS, AVOID_DEPOSIT_FS);
+  quadVAO  = makeQuadVAO();
+  brushVAO = makeBrushVAO();
+}
+function destroyResources(){
+  for (let i = 0; i < 2; i++){
+    if (entityTex[i]){ gl.deleteTexture(entityTex[i]); gl.deleteFramebuffer(entityFBO[i]); }
+    if (canvasTex[i]){ gl.deleteTexture(canvasTex[i]); gl.deleteFramebuffer(canvasFBO[i]); }
+    if (paintTex[i]){ gl.deleteTexture(paintTex[i]); gl.deleteFramebuffer(paintFBO[i]); }
+    if (avoidTex[i]){ gl.deleteTexture(avoidTex[i]); gl.deleteFramebuffer(avoidFBO[i]); avoidTex[i] = null; avoidFBO[i] = null; }
+  }
+  avoidPing = 0;
+  if (brushTex){ gl.deleteTexture(brushTex); gl.deleteFramebuffer(brushFBO); }
+  if (sceneBufTex){ gl.deleteTexture(sceneBufTex); gl.deleteFramebuffer(sceneBufFBO); sceneBufTex = null; sceneBufFBO = null; }
+  for (let i = 0; i < 2; i++){
+    if (accumTex[i]){ gl.deleteTexture(accumTex[i]); gl.deleteFramebuffer(accumFBO[i]); accumTex[i] = null; accumFBO[i] = null; }
+  }
+  accumPing = 0;
+}
+function createResources(){
+  destroyResources();
+  C = computeConstants();
+  for (let i = 0; i < 2; i++){ entityTex[i] = floatTex(C.entityTexWidth, C.entityTexHeight, false); entityFBO[i] = fboOf(entityTex[i]); }
+  for (let i = 0; i < 2; i++){ canvasTex[i] = floatTex(C.canvasWidth, C.canvasHeight, true); canvasFBO[i] = fboOf(canvasTex[i]); }
+  for (let i = 0; i < 2; i++){ paintTex[i] = floatTex(C.canvasWidth, C.canvasHeight, true); paintFBO[i] = fboOf(paintTex[i]); }
+  for (let i = 0; i < 2; i++){ avoidTex[i] = floatTex(C.avoidRes, C.avoidRes, true); avoidFBO[i] = fboOf(avoidTex[i]); }
+  paintPing = 0;
+  brushTex = floatTex(C.canvasWidth, C.canvasHeight, true);
+  brushFBO = fboOf(brushTex);
+  sceneBufTex = screenTex(C.canvasWidth, C.canvasHeight); sceneBufFBO = fboOf(sceneBufTex);
+  for (let i = 0; i < 2; i++){ accumTex[i] = screenTex(C.canvasWidth, C.canvasHeight); accumFBO[i] = fboOf(accumTex[i]); }
+  entityPing = 0; canvasPing = 0; avoidPing = 0; frameCount = 0; ruleDirty = true; accumPing = 0;
+}
+
+function setConfigUniforms(p){
+  u4f(p, 'config_a', [cfg.cohorts, cfg.rule_seed, cfg.sensor_gain, cfg.sensor_angle]);
+  u4f(p, 'config_b', [cfg.sensor_distance, cfg.mutation_scale, cfg.global_force_mult, cfg.drag]);
+  u4f(p, 'config_c', [cfg.strafe_power, cfg.axial_force, cfg.lateral_force, cfg.hazard_rate]);
+  u4f(p, 'config_avoid', [cfg.avoid_radius * 2 / C.canvasWidth, cfg.avoid_strength, app.avoid ? 1 : 0, 0]);
+}
+function setRuleUniforms(p){
+  if (!ruleDirty) return;
+  for (let i = 0; i < 10; i++){
+    const b = i * 8;
+    u4f(p, 'config_rule.centers[' + i + '].frequency', cfg.rule.slice(b, b + 4));
+    u4f(p, 'config_rule.centers[' + i + '].amplitude', cfg.rule.slice(b + 4, b + 8));
+  }
+  ruleDirty = false;
+}
+function createBrush(){
+  const p = progBrush;
+  gl.useProgram(p);
+  gl.bindFramebuffer(gl.FRAMEBUFFER, brushFBO);
+  gl.viewport(0, 0, C.canvasWidth, C.canvasHeight);
+  gl.clearColor(0, 0, 0, 0); gl.clear(gl.COLOR_BUFFER_BIT);
+  gl.enable(gl.BLEND); gl.blendFunc(gl.SRC_ALPHA, gl.ONE);
+  bindTex(0, entityTex[entityPing], p, 'entity_texture');
+  u1i(p, 'entity_tex_width', C.entityTexWidth);
+  u1i(p, 'frame_count', frameCount);
+  gl.bindVertexArray(brushVAO);
+  gl.drawArraysInstanced(gl.TRIANGLE_FAN, 0, 4, C.entityCount);
+  gl.disable(gl.BLEND);
+}
+function updateEntities(){
+  const p = progEntity, r = entityPing, w = 1 - r;
+  gl.useProgram(p);
+  gl.bindFramebuffer(gl.FRAMEBUFFER, entityFBO[w]);
+  gl.viewport(0, 0, C.entityTexWidth, C.entityTexHeight);
+  bindTex(0, entityTex[r], p, 'entity_texture');
+  bindTex(1, canvasTex[canvasPing], p, 'canvas_texture');
+  bindTex(2, avoidTex[avoidPing], p, 'avoid_texture');
+  setConfigUniforms(p);
+  setRuleUniforms(p);
+  u1f(p, 'u_reset_seed', app.resetSeed);
+  u1i(p, 'frame_count', frameCount);
+  u1i(p, 'entity_count', C.entityCount);
+  u1i(p, 'entity_tex_width', C.entityTexWidth);
+  gl.bindVertexArray(quadVAO);
+  gl.drawArrays(gl.TRIANGLES, 0, 6);
+  entityPing = w;
+}
+// One shader drives both diffusing layers: the flow field (sensed) and the paint (shown in field view).
+function updateLayer(tex, fbo, ping, persistence, gain){
+  const p = progCanvas, w = 1 - ping;
+  gl.bindFramebuffer(gl.FRAMEBUFFER, fbo[w]);
+  bindTex(1, tex[ping], p, 'canvas_texture');
+  u1f(p, 'persistence', persistence);
+  u1f(p, 'gain', gain);
+  gl.drawArrays(gl.TRIANGLES, 0, 6);
+  return w;
+}
+// Decay the density memory, then splat the current particle positions into it.
+function updateAvoid(){
+  if (!app.avoid) return;
+  const r = avoidPing, w = 1 - r;
+  const p = progAvoidDecay;
+  gl.useProgram(p);
+  gl.bindFramebuffer(gl.FRAMEBUFFER, avoidFBO[w]);
+  gl.viewport(0, 0, C.avoidRes, C.avoidRes);
+  bindTex(0, avoidTex[r], p, 'avoid_texture');
+  u1f(p, 'avoid_fade', cfg.avoid_fade);
+  gl.bindVertexArray(quadVAO);
+  gl.drawArrays(gl.TRIANGLES, 0, 6);
+
+  const q = progAvoidDeposit;
+  gl.useProgram(q);
+  bindTex(0, entityTex[entityPing], q, 'entity_texture');
+  u1i(q, 'entity_tex_width', C.entityTexWidth);
+  u1f(q, 'u_half_size', AVOID_SPLAT_TEXELS * 2.0 / C.avoidRes);
+  u1f(q, 'u_weight', AVOID_DEPOSIT_WEIGHT);
+  gl.enable(gl.BLEND); gl.blendFunc(gl.ONE, gl.ONE);
+  gl.bindVertexArray(brushVAO);
+  gl.drawArraysInstanced(gl.TRIANGLE_FAN, 0, 4, C.entityCount);
+  gl.disable(gl.BLEND);
+  avoidPing = w;
+}
+function advance(){
+  createBrush();
+  updateEntities();
+  updateAvoid();
+  const p = progCanvas;
+  gl.useProgram(p);
+  gl.viewport(0, 0, C.canvasWidth, C.canvasHeight);
+  gl.bindVertexArray(quadVAO);
+  bindTex(0, brushTex, p, 'brush_texture');
+  u1i(p, 'frame_count', frameCount);
+  u4f(p, 'trail_draw_mouse', [mouse.uv[0], mouse.uv[1], mouse.prev[0], mouse.prev[1]]);
+  u1f(p, 'trail_draw_radius', DRAW_RADIUS);
+  u1f(p, 'trail_draw_power', (app.draw && mouse.down && mouse.moved) ? DRAW_POWER : 0);
+  u2f(p, 'canvas_resolution', [C.canvasWidth, C.canvasHeight]);
+  const tp = Math.min(cfg.trail_persistence, 0.999);
+  canvasPing = updateLayer(canvasTex, canvasFBO, canvasPing, tp, 1 - tp);   // Fluoddity mix: equilibrium independent of persistence
+  paintPing  = updateLayer(paintTex,  paintFBO,  paintPing,  PAINT_PERSISTENCE, PAINT_GAIN);
+  frameCount++;
+}
+function spritePass(target){
+  const p = progSprite;
+  gl.useProgram(p);
+  gl.bindFramebuffer(gl.FRAMEBUFFER, target);
+  gl.viewport(0, 0, C.canvasWidth, C.canvasHeight);
+  gl.clearColor(0, 0, 0, 0); gl.clear(gl.COLOR_BUFFER_BIT);
+  bindTex(0, entityTex[entityPing], p, 'entity_texture');
+  u1i(p, 'entity_tex_width', C.entityTexWidth);
+  u1i(p, 'entity_count', C.entityCount);
+  u1i(p, 'cohorts', cfg.cohorts);
+  u2f(p, 'u_field_px', [C.canvasWidth, C.canvasHeight]);
+  u1f(p, 'u_particle_px', app.particlePx);
+  u1f(p, 'u_snap', app.hardPixels ? 1 : 0);
+  u1f(p, 'u_hue_drift', performance.now() * 0.001 * HUE_DRIFT_PER_SEC);
+  u1f(p, 'brightness', app.brightness);
+  u1f(p, 'u_hard', app.hardPixels ? 1 : 0);
+  u1f(p, 'u_opacity', app.opacity);
+  gl.enable(gl.BLEND);
+  // solid: premultiplied rgb + true coverage alpha
+  gl.blendFuncSeparate(gl.SRC_ALPHA, gl.ONE_MINUS_SRC_ALPHA, gl.ONE, gl.ONE_MINUS_SRC_ALPHA);
+  gl.bindVertexArray(brushVAO);
+  gl.drawArraysInstanced(gl.TRIANGLE_FAN, 0, 4, C.entityCount);
+  gl.disable(gl.BLEND);
+}
+
+// Fit the square sim inside the window. Prefer integer nearest-neighbour scaling when it
+// nearly fills the viewport (keeps hard pixels); otherwise use a filtered fractional fit.
+function viewportMap(){
+  const W = gl.drawingBufferWidth, H = gl.drawingBufferHeight, N = C.canvasWidth;
+  const min = Math.min(W, H);
+  const fit = min / N;
+  let scale = fit, snap = 0;
+  if (fit >= 1){
+    const k = Math.floor(fit);
+    if (N * k >= min * 0.85){ scale = k; snap = 1; }
+  }
+  return { scale, snap, ox: Math.floor((W - N * scale) / 2), oy: Math.floor((H - N * scale) / 2), W, H, N };
+}
+function presentPass(tex){
+  const p = progPresent;
+  gl.useProgram(p);
+  bindTex(0, tex, p, 'tex');
+  const v = viewportMap();
+  gl.uniform2i(loc(p, 'offset'), v.ox, v.oy);
+  gl.uniform1f(loc(p, 'scale'), v.scale);
+  gl.uniform1i(loc(p, 'snap'), v.snap);
+  gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+  gl.viewport(0, 0, gl.drawingBufferWidth, gl.drawingBufferHeight);
+  gl.bindVertexArray(quadVAO);
+  gl.drawArrays(gl.TRIANGLES, 0, 6);
+}
+function clearAccum(){
+  for (let i = 0; i < 2; i++){
+    gl.bindFramebuffer(gl.FRAMEBUFFER, accumFBO[i]);
+    gl.clearColor(0, 0, 0, 1); gl.clear(gl.COLOR_BUFFER_BIT);
+  }
+  gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+  accumPing = 0;
+}
+function clearAvoid(){
+  for (let i = 0; i < 2; i++){
+    gl.bindFramebuffer(gl.FRAMEBUFFER, avoidFBO[i]);
+    gl.clearColor(0, 0, 0, 1); gl.clear(gl.COLOR_BUFFER_BIT);
+  }
+  gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+  avoidPing = 0;
+}
+function resetSim(seed){
+  frameCount = 0;
+  app.resetSeed = typeof seed === 'number' ? seed : Math.random() * 1000;
+  clearAccum();
+  clearAvoid();
+  for (let i = 0; i < 2; i++){
+    gl.bindFramebuffer(gl.FRAMEBUFFER, paintFBO[i]);
+    gl.clearColor(0, 0, 0, 1); gl.clear(gl.COLOR_BUFFER_BIT);
+  }
+  gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+  paintPing = 0;
+}
+function render(){
+  if (app.view === 'particles'){
+    spritePass(sceneBufFBO);
+  } else {
+    const p = progField;
+    gl.useProgram(p);
+    bindTex(0, paintTex[paintPing], p, 'tex');
+    u1f(p, 'brightness', app.brightness);
+    u1f(p, 'u_hard', app.hardPixels ? 1 : 0);
+    gl.bindFramebuffer(gl.FRAMEBUFFER, sceneBufFBO);
+    gl.viewport(0, 0, C.canvasWidth, C.canvasHeight);
+    gl.bindVertexArray(quadVAO);
+    gl.drawArrays(gl.TRIANGLES, 0, 6);
+  }
+  let sceneTex = sceneBufTex;
+  if (!app.paused){   // keep = 0 already yields the live frame, so the slider is continuous from 0
+    const p = progComp;
+    gl.useProgram(p);
+    const r = accumPing, wr = 1 - r;
+    bindTex(0, sceneTex, p, 'view_tex');
+    bindTex(1, accumTex[r], p, 'accum_tex');
+    u1f(p, 'accum_amount', app.accum);
+    gl.bindFramebuffer(gl.FRAMEBUFFER, accumFBO[wr]);
+    gl.viewport(0, 0, C.canvasWidth, C.canvasHeight);
+    gl.bindVertexArray(quadVAO);
+    gl.drawArrays(gl.TRIANGLES, 0, 6);
+    accumPing = wr;
+    sceneTex = accumTex[wr];
+  }
+  presentPass(sceneTex);
+}
+
+function newOrganism(){
+  const seed = f32(Math.random() * 1000);
+  cfg.rule = randomOrganism(seed);
+  cfg.rule_seed = seed;
+  ruleDirty = true;
+  resetSim();
+}
+function mutate(){
+  cfg.rule = mutateOrganism(cfg.rule, 0.15 * (0.5 + cfg.mutation_scale), Math.random() * 1000);
+  ruleDirty = true;
+}
+
+function setPaused(v){ app.paused = v; $('bPause').textContent = v ? 'resume' : 'pause'; $('bPause').classList.toggle('on', v); }
+function setDraw(v){ app.draw = v; canvas.classList.toggle('drawing', v); $('bDraw').classList.toggle('on', v); }
+function setView(v){ if (v !== app.view){ app.view = v; clearAccum(); } $('bView').textContent = 'view: ' + v; }
+function setHard(v){ app.hardPixels = v; $('bHard').classList.toggle('on', v); }
+function setAvoid(v){
+  app.avoid = v;
+  if (v) clearAvoid();
+  $('bAvoid').textContent = 'avoid: ' + (v ? 'on' : 'off');
+  $('bAvoid').classList.toggle('on', v);
+}
+
+const sliderMeta = {};
+function setAppSlider(key, v){
+  if (key === '__brightness') app.brightness = v;
+  else if (key === '__accum') app.accum = v;
+  else if (key === '__particlePx') app.particlePx = v;
+  else if (key === '__opacity') app.opacity = v;
+}
+function appVal(key){
+  return key === '__brightness' ? app.brightness : key === '__accum' ? app.accum
+       : key === '__particlePx' ? app.particlePx : key === '__opacity' ? app.opacity : cfg[key];
+}
+function addSlider(parent, key, label, min, max, step, fmt){
+  const row = document.createElement('div'); row.className = 'row';
+  const lab = document.createElement('label'); lab.textContent = label;
+  const inp = document.createElement('input'); inp.type = 'range'; inp.min = min; inp.max = max; inp.step = step;
+  const out = document.createElement('output');
+  row.append(lab, inp, out); parent.appendChild(row);
+  const fill = () => inp.style.setProperty('--p', ((parseFloat(inp.value) - min) / (max - min) * 100).toFixed(2) + '%');
+  const refresh = v => { inp.value = v; out.textContent = fmt(v); fill(); };
+  inp.addEventListener('input', () => {
+    const v = parseFloat(inp.value);
+    if (key.startsWith('__')) setAppSlider(key, v); else cfg[key] = v;
+    refresh(v);
+  });
+  sliderMeta[key] = { refresh };
+  return refresh;
+}
+
+initGL();
+createResources();
+
+const canvas = $('c');
+canvas.addEventListener('pointerdown', e => {
+  mouse.down = true; mouse.prev = mouseUV(e); mouse.uv = mouseUV(e); mouse.moved = false;
+  canvas.setPointerCapture(e.pointerId);
+});
+canvas.addEventListener('pointermove', e => { if (mouse.down){ mouse.prev = mouse.uv; mouse.uv = mouseUV(e); mouse.moved = true; } });
+canvas.addEventListener('pointerup', () => { mouse.down = false; mouse.moved = false; });
+function mouseUV(e){
+  const v = viewportMap(), r = canvas.getBoundingClientRect();
+  const px = (e.clientX - r.left) * v.W / r.width, py = v.H - (e.clientY - r.top) * v.H / r.height;
+  return [(px - v.ox) / (v.N * v.scale), (py - v.oy) / (v.N * v.scale)];
+}
+window.addEventListener('keydown', e => {
+  if (e.target.tagName === 'INPUT' || e.target.tagName === 'SELECT') return;
+  const k = e.key.toLowerCase();
+  if (k === ' '){ setPaused(!app.paused); e.preventDefault(); }
+  else if (k === 'r') resetSim();
+  else if (k === 'n') newOrganism();
+  else if (k === 'm') mutate();
+  else if (k === 'h') $('panel').classList.toggle('hidden');
+  else if (k === 'd') setDraw(!app.draw);
+  else if (k === 'f') setView(app.view === 'particles' ? 'field' : 'particles');
+  else if (k === 'p') setHard(!app.hardPixels);
+  else if (k === 'a') setAvoid(!app.avoid);
+});
+
+$('bPause').onclick = () => setPaused(!app.paused);
+$('bReset').onclick = resetSim;
+$('bNew').onclick = newOrganism;
+$('bMutate').onclick = mutate;
+$('bDraw').onclick = () => setDraw(!app.draw);
+$('bView').onclick = () => setView(app.view === 'particles' ? 'field' : 'particles');
+$('bHard').onclick = () => setHard(!app.hardPixels);
+$('bAvoid').onclick = () => setAvoid(!app.avoid);
+
+const secAvoid = $('secAvoid'), secPhys = $('secPhysics'), secField = $('secField');
+const AVOID_SLIDERS = [
+  ['avoid_strength','strength',0,1.5,0.01, v => v.toFixed(2)],
+  ['avoid_radius','radius',2,20,0.5, v => v.toFixed(1) + ' px'],
+  ['avoid_fade','memory',0.8,0.995,0.001, v => v.toFixed(3)],
+];
+const PHYS_SLIDERS = [
+  ['sensor_angle','sensor angle',-1,1,0.001, v => (v*180).toFixed(1) + '\u00b0'],
+  ['sensor_distance','sensor dist',-2,3,0.01, v => v.toFixed(2)],
+  ['sensor_gain','sensor gain',0,10,0.01, v => v.toFixed(2)],
+  ['global_force_mult','force',-1,2,0.01, v => v.toFixed(2)],
+  ['axial_force','axial',-1,1,0.001, v => v.toFixed(3)],
+  ['lateral_force','lateral',-2,1,0.001, v => v.toFixed(3)],
+  ['drag','drag',-1,1,0.001, v => v.toFixed(3)],
+  ['strafe_power','strafe',0,0.5,0.001, v => v.toFixed(3)],
+  ['mutation_scale','mutation',0,1,0.005, v => v.toFixed(3)],
+  ['hazard_rate','hazard',0,0.05,0.0005, v => v.toFixed(4)],
+];
+const FIELD_SLIDERS = [
+  ['trail_persistence','persistence',0,1,0.001, v => v.toFixed(3)],
+  ['__brightness','brightness',0.2,3,0.01, v => v.toFixed(2)],
+  ['__accum','accumulation',0,1,0.01, v => v.toFixed(2)],
+  ['__particlePx','particle size',1,8,1, v => v + ' px'],
+  ['__opacity','opacity',0,1,0.01, v => v.toFixed(2)],
+];
+for (const s of AVOID_SLIDERS) addSlider(secAvoid, ...s);
+for (const s of PHYS_SLIDERS) addSlider(secPhys, ...s);
+for (const s of FIELD_SLIDERS) addSlider(secField, ...s);
+
+const sCohorts = $('sCohorts'), oCohorts = $('oCohorts');
+sCohorts.addEventListener('input', () => { cfg.cohorts = parseInt(sCohorts.value); oCohorts.textContent = cfg.cohorts; });
+
+const sSize = $('sSize'), oSize = $('oSize');
+for (let i = 0; i < SIZE_OPTIONS.length; i++){
+  const option = document.createElement('option');
+  option.value = String(i);
+  option.textContent = SIZE_OPTIONS[i].label;
+  sSize.appendChild(option);
+}
+sSize.addEventListener('change', () => setSize(parseInt(sSize.value, 10)));
+
+function syncUI(){
+  sSize.value = String(app.sizeIndex);
+  oSize.textContent = SIZE_OPTIONS[app.sizeIndex].edge + '\u00b2';
+  sCohorts.value = cfg.cohorts; oCohorts.textContent = cfg.cohorts;
+  for (const key of Object.keys(sliderMeta)){
+    const v = appVal(key);
+    if (typeof v === 'number') sliderMeta[key].refresh(v);
+  }
+}
+function setSize(index){
+  index = Math.max(0, Math.min(SIZE_OPTIONS.length - 1, index | 0));
+  if (index === app.sizeIndex) return;
+  const oldEdge = SIZE_OPTIONS[app.sizeIndex].edge;
+  const newEdge = SIZE_OPTIONS[index].edge;
+  cfg.avoid_radius = Math.min(20, Math.max(2, Math.round(cfg.avoid_radius * newEdge / oldEdge * 2) / 2));
+  app.sizeIndex = index;
+  createResources();
+  resetSim();
+  advance();
+  syncUI();
+}
+
+resetSim();
+syncUI();
+setAvoid(app.avoid);
+
+let fpsEMA = 60, frameLast = 0, nextMutation = performance.now() + MUTATE_INTERVAL_MS;
+function frame(now){
+  const dt = now - frameLast; frameLast = now;
+  if (dt > 0 && dt < 1000) fpsEMA = fpsEMA * 0.95 + (1000/dt) * 0.05;
+  if (!app.paused){
+    advance();
+    if (now >= nextMutation){ mutate(); nextMutation = now + MUTATE_INTERVAL_MS; }   // auto-mutate every 90 s of runtime
+  }
+  render();
+  $('hud').textContent = fpsEMA.toFixed(0) + ' fps \u00b7 ' + (C.entityCount/1e6).toFixed(2) + 'M particles \u00b7 field ' + C.canvasWidth + '\u00d7' + C.canvasHeight + ' \u00b7 ' + C.sizeLabel + ' \u00b7 avoid ' + (app.avoid ? 'on' : 'off') + (app.paused ? ' \u00b7 PAUSED' : '');
+  mouse.moved = false;
+  requestAnimationFrame(frame);
+}
+requestAnimationFrame(frame);
+</script>
+</body>
+</html>

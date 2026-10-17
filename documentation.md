@@ -17,6 +17,7 @@ hypercells/
 ├── documentation.md            ← this file
 ├── .gitignore                  ← keeps the ~35 GB of recordings out of git
 ├── simple/                     ← baseline interactive build (simple/index.html)
+├── avoid/                      ← simple + particle-density avoidance (avoid/index.html)
 ├── color/                      ← gallery build: colour textures, presets, config auto-cycling
 ├── hypercells-4k/              ← 4K autopilot build (standalone, everything inlined)
 ├── evolve/                     ← autopilot show + LLM evolution tooling
@@ -41,12 +42,13 @@ hypercells/
 | Version | How |
 |---|---|
 | simple | open `simple/index.html` in a browser (fully self-contained) |
+| avoid | open `avoid/index.html` (simple + particle avoidance, fully self-contained) |
 | color | open `color/index.html` (loads `../config/configs.js` + `../config/textures.js`) |
 | autopilot | open `hypercells-4k/hypercells-4k.html` — or `evolve/hypercells-evolve.html` for the no-bridge show |
 | evolve | `cd evolve && npm install && node bridge.mjs`, then open `http://localhost:8787/hypercells-evolve.html` and switch **evolve: on** |
 | docs site | open `docs/index.html` |
 
-All four apps render full-screen; press `h` to reveal the control panel. Everything is
+All five apps render full-screen; press `h` to reveal the control panel. Everything is
 offline and free — there are no network calls (the bridge only talks to localhost).
 
 ---
@@ -78,6 +80,7 @@ the particles into colour groups, each running its own mutation of the shared ru
 | Version | File | Title | Role |
 |---|---|---|---|
 | **simple** | `simple/index.html` | hypercells — fluoddity-style physarum | stripped-back *interactive* build: draw mode, manual control, auto-mutates every 90 s |
+| **avoid** | `avoid/index.html` | hypercells — particle avoidance | simple + a decaying particle-density field and a clamped repulsion force, with strength/radius/memory controls |
 | **color** | `color/index.html` | hypercells — fluoddity-style physarum | *gallery* build: image-derived colour palettes, presets, config auto-cycling, blend/tonemap paths, no draw mode |
 | **autopilot** | `evolve/hypercells-evolve.html` | hypercells — autopilot | *self-animating* build + LLM evolution: glide-morphs between 17 anchors, health-monitored, bridgeable to an LLM that rewrites the behaviour shader |
 | **4K** | `hypercells-4k/hypercells-4k.html` | hypercells — autopilot 4K | exactly the autopilot build with 7 constants changed for 4K output (§3.4) |
@@ -101,6 +104,34 @@ autopilot show, seeded and offline).
 - **Auto-mutate** every 90 s of runtime (in addition to the mutate button).
 - Fixed: `PAINT_GAIN 0.016`, `PAINT_PERSISTENCE 0.995`, canvas diffusion `K = 1`, no tonemap.
 - 600 000 particles, 1024×1024 field, cohorts default 7, accumulation default 0.
+
+### 3.1b avoid — shader/pipeline differences
+
+The avoidance build is `simple` plus one extra offscreen stage (a decay draw + an instanced
+density deposit) and one extra force term:
+
+- A separate **RGBA32F density field at half the flow-field edge** (256² at 128k, 362² at
+  256k, 512² at 512k, 724² at 1024k) is ping-ponged independently of the flow field. Each
+  step it decays by `avoid_fade` (memory) and receives one normalized 2-D Gaussian splat
+  per particle (half-size 3 avoid texels).
+- **Size dropdown** (Organism section): `128k` (512² field, default), `256k` (724²),
+  `512k` (1024²), `1024k` (1448²). Particle count and field edge scale together so density
+  per texel is constant. Changing size recreates the textures, resets the simulation, and
+  scales `avoid_radius` by the edge ratio so the avoidance pattern keeps its visual size.
+  The present pass uses integer nearest-neighbour scaling when it nearly fills the window,
+  otherwise a filtered fractional fit, so every grid fills the display.
+- `ENTITY_FS` samples the density at four axial offsets (`avoid_radius` in current-field
+  texels), divides the central difference by `1 + center_density`, and adds
+  `-gradient * avoid_strength * 0.002` to the velocity update. The result is clamped to
+  ±0.004 per step so extreme settings cannot explode the simulation.
+- The avoidance field is deposited **after** the move, so particles read the previous
+  step's density and the flow field keeps its original one-frame lag.
+- New controls: `avoid: on/off` button + `a` key; **strength** (0–1.5, default 0.35),
+  **radius** (2–20 field px, default 6 at 128k and scaled with size), **memory**
+  (0.8–0.995, default 0.97). Disabling avoidance skips both passes; enabling it clears
+  stale density. Reset clears it too.
+- This is soft repulsion: it creates lanes and strongly reduces crossings, but does not
+  mathematically guarantee that two particle trajectories never intersect.
 
 ### 3.2 color — shader/pipeline differences
 
@@ -278,11 +309,22 @@ are written once in the shared column.
 | hue drift | `app.hueDrift` (`__hueDrift`) | autopilot/4K 0…0.01, step 0.001 (0.010) | Rate at which the whole cohort palette travels (cycles/s). simple drifts a fixed 0.005 with a two-half scheme; color replaces hue with textures. |
 | hue wobble | `app.hueWobble` (`__hueWobble`) | autopilot/4K 0…0.05, step 0.005 (0.04) | Bounded per-cohort hue breathing (amplitude of a sine on the group's phase), so the palette inhales/exhales but never drifts away. |
 
+### 4.2b Avoidance sliders (avoid only)
+
+| Slider | Key | Range (default) | What it does |
+|---|---|---|---|
+| strength | `avoid_strength` | 0…1.5, step 0.01 (0.35) | Multiplies the density-gradient repulsion. Higher values open wider gaps but can overpower the organism's own flow. |
+| radius | `avoid_radius` | 2…20 field texels, step 0.5 (6 at 128k; scales with world size) | Distance of the four density taps around each particle. Larger radii sense broader crowds and produce wider lanes. |
+| memory | `avoid_fade` | 0.8…0.995, step 0.001 (0.97) | Per-step persistence of the density field. Higher values make recently occupied paths repel for longer. |
+
+The `avoid: on/off` button (key `a`) toggles the two avoidance passes; enabling it clears stale density. Reset clears the density field as well.
+
 ### 4.3 Organism & world
 
 | Control | Builds | Values (default) | What it does |
 |---|---|---|---|
 | cohorts | all | 1…24 (simple 7; others 12) | Number of colour groups. Each group runs its own mutation of the shared rule (rule texture columns); on change later builds reset the sim. Particles start in a **ring** in every build. |
+| size | avoid | 128k (512²) / 256k (724²) / 512k (1024²) / 1024k (1448²); default **128k** | Particle count and flow-field edge scale together (constant density per texel). Changing size recreates the textures, resets the sim, and scales `avoid_radius` by the edge ratio. The present pass fits every size to the window. |
 | world size | color, autopilot | tiny 0.08 / small 0.25 / medium 0.5 / **large 1.0** | Scales everything: particles 48k/150k/300k/600k and field 289/512/724/1024 texels (the field edge is `1024×√size` so tuned distances hold). |
 | world size | 4K | **0.5M / 1M / 2M** | Particle count only (density knob): 500k/1M/2M particles, the 3840×2160 field is fixed, and deposits are normalised so strength is unchanged. |
 | start | color | random / grid / **ring** | Initial layout. grid = one spawn spot per cohort; ring = cohorts evenly on a circle. Other builds: ring only (hazard respawns are always random). |
