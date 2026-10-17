@@ -149,6 +149,9 @@ a separable blur and a decay/combine draw) and one extra force term:
   **radius** (2–20 field px, default 6 at 128k and scaled with size), **memory**
   (0.8–0.995, default 0.97). Disabling avoidance skips both passes; enabling it clears
   stale density. Reset clears it too.
+- **Hue drift** is now a *Field & render* slider (0–0.01, step 0.001, **default 0**); at 0
+  the cohorts keep their colours indefinitely, so particles stay aligned with cohort
+  colours. **Persistence** was moved from *Field & render* to *Physics*.
 - This is soft repulsion: it creates lanes and strongly reduces crossings, but does not
   mathematically guarantee that two particle trajectories never intersect.
 
@@ -194,7 +197,9 @@ population readback. Simulation, avoidance, rendering and the size dropdown are 
   changes, reset and new organism reinitialise the state and reset the round to 1.
 - **Controls.** `battle: on/off` button + key `b` (off = dominance, fights, readback and
   rounds are skipped; colours and behaviour freeze); **aggression** 0–0.3, default 0.05
-  (0 = no conversions); **blend** 0.25–4 s, default 1.0 (converted to frames at 60 fps).
+  (0 = no conversions); **blend** 0.25–4 s, default 1.0 (converted to frames at 60 fps);
+  **hue drift** 0–0.01, default **0**, in *Field & render*, so particle hues and the cohort
+  bar stay aligned by default. **Persistence** is in *Physics*.
 - **Performance.** The fight build adds one MAX-blended instanced splat, one fullscreen state
   pass, and a 24×1 histogram + readback every 30 frames. There is no per-particle CPU work
   and no extra per-frame texture upload. On the 128k default the extra cost is a few
@@ -363,7 +368,7 @@ are written once in the shared column.
 | axial | `axial_force` | simple/color −1…1 (≈ 0.359) | Scales the *forward* component of both force and strafe in the particle's local frame. simple/color only. autopilot/4K keep the parameter (clamped ±1.2) but give it no slider — the autopilot and LLM morph it. |
 | lateral | `lateral_force` | simple/color −2…1 (≈ −1.294; autopilot/4K runs 0.303) | Scales the *sideways* components, same as above. simple/color only. |
 | strafe | `strafe_power` | simple/color 0…0.5 (≈ 0.076) | Multiplies the direct position offset `pos += strafe` (not a force). simple/color only. |
-| persistence | `trail_persistence` | simple/color 0…1 (0.975 / 0.982); autopilot/4K 0.95…0.998 (0.982) | How much of the flow field survives each step — trail length. simple/color sit it in *Field & render*; autopilot/4K put it in *Physics* because anchors morph it. |
+| persistence | `trail_persistence` | simple/color 0…1 (0.975 / 0.982); avoid/fight 0…1 (0.975); autopilot/4K 0.95…0.998 (0.982) | How much of the flow field survives each step — trail length. simple/color sit it in *Field & render*; avoid/fight and autopilot/4K put it in *Physics*. |
 
 ### 4.2 Field & render sliders
 
@@ -378,7 +383,7 @@ are written once in the shared column.
 | solid fade | `app.solidFade` (`__solidFade`) | color 0.9…1 (1) | Bounded memory of the solid blend so overlaps build up but stop short of smearing. |
 | opacity | `app.opacity` | simple 0…1 (0.5) | Scales sprite coverage after the kernel, so overlaps accumulate instead of clamping. simple only. |
 | particle size | `app.particlePx` (`__particlePx`) | simple 1…8 px (1); autopilot 0…4 (**0 = soft**); 4K 0…4 (**1 = hard**) | 0 = soft gaussian sprite (1.152 texels); 1…4 = hard, texel-grid-snapped squares of N field texels. A 1-px hard particle lands on exactly one pixel. |
-| hue drift | `app.hueDrift` (`__hueDrift`) | autopilot/4K 0…0.01, step 0.001 (0.010) | Rate at which the whole cohort palette travels (cycles/s). simple drifts a fixed 0.005 with a two-half scheme; color replaces hue with textures. |
+| hue drift | `hue_drift` (avoid/fight); `app.hueDrift` (`__hueDrift`, autopilot/4K) | avoid/fight 0…0.01, step 0.001 (**0**); autopilot/4K 0…0.01, step 0.001 (0.010) | Rate at which the whole cohort palette travels (hue units/s). avoid/fight default to **0** so particles keep their cohort colours (the old fixed rate was 0.005). simple drifts a fixed 0.005 with a two-half scheme; color replaces hue with textures. |
 | hue wobble | `app.hueWobble` (`__hueWobble`) | autopilot/4K 0…0.05, step 0.005 (0.04) | Bounded per-cohort hue breathing (amplitude of a sine on the group's phase), so the palette inhales/exhales but never drifts away. |
 
 ### 4.2b Avoidance sliders (avoid, fight)
@@ -531,7 +536,8 @@ fizz ratio threshold 0.55, `MUTATE_SECONDS 5`, `EVO_BLEND_MIN_SEC 3`,
 
 simple-only: `PAINT_GAIN 0.016`, `PAINT_PERSISTENCE 0.995`, `DRAW_RADIUS 0.05`,
 `DRAW_POWER 0.3`, `MUTATE_INTERVAL_MS 90000`, `HUE_DRIFT_PER_SEC 0.005`, `COLOR_NOISE
-0.03`, `SPRITE_ASPECT 3.0` (velocity-aligned dashes).
+0.03`, `SPRITE_ASPECT 3.0` (velocity-aligned dashes). avoid/fight replace the fixed drift
+with the `hue_drift` slider (0…0.01, default 0, old value 0.005).
 
 color-only: `SPRITE_SIZE 1.5`, `TONEMAP_SOFTNESS 3.9`, `BRIGHTNESS_CONSTANT 2.0`,
 `AUTO_DWELL 120`, `AUTO_FADE 10`, `TEX_FADE_MS 2500`, `ARTIFICIAL_HUES` (12 values).
